@@ -4,6 +4,10 @@
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
   "allowed_domains": [],
+  "user_agent": "ReconMCP/0.1",
+  "request_delay_ms": 500,
+  "max_requests_per_tool_call": 20,
+  "fetch_headers_method": "HEAD",
   "blocked_domains": [
     "localhost",
     "127.0.0.1",

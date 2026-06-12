@@ -12,6 +12,10 @@ from recon.h1_scope import H1ScopeError, extract_allowed_hosts_from_h1_entries, 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SCOPE_PATH = PROJECT_ROOT / "config" / "scope.json"
+DEFAULT_USER_AGENT = "ReconMCP/0.1"
+DEFAULT_REQUEST_DELAY_MS = 500
+DEFAULT_MAX_REQUESTS_PER_TOOL_CALL = 20
+DEFAULT_FETCH_HEADERS_METHOD = "HEAD"
 
 
 class ScopeError(ValueError):
@@ -28,6 +32,10 @@ def load_scope() -> dict:
             "scope_source": "manual",
             "allowed_domains": [],
             "blocked_domains": [],
+            "user_agent": DEFAULT_USER_AGENT,
+            "request_delay_ms": DEFAULT_REQUEST_DELAY_MS,
+            "max_requests_per_tool_call": DEFAULT_MAX_REQUESTS_PER_TOOL_CALL,
+            "fetch_headers_method": DEFAULT_FETCH_HEADERS_METHOD,
         }
     except json.JSONDecodeError as exc:
         raise ScopeError(f"Invalid scope config: {exc}") from exc
@@ -39,6 +47,10 @@ def load_scope() -> dict:
         "include_only_submission_eligible": bool(data.get("include_only_submission_eligible", False)),
         "allowed_domains": data.get("allowed_domains", []),
         "blocked_domains": data.get("blocked_domains", []),
+        "user_agent": str(data.get("user_agent") or DEFAULT_USER_AGENT),
+        "request_delay_ms": int(data.get("request_delay_ms", DEFAULT_REQUEST_DELAY_MS)),
+        "max_requests_per_tool_call": int(data.get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL)),
+        "fetch_headers_method": str(data.get("fetch_headers_method") or DEFAULT_FETCH_HEADERS_METHOD).upper(),
     }
 
 

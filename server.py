@@ -85,9 +85,9 @@ def collect_js_urls(url: str) -> dict:
 
 
 @mcp.tool()
-def extract_endpoints_from_js(file_or_url: str) -> dict:
+def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) -> dict:
     """Safely extract endpoint candidates from authorized JS URLs or local project JS files."""
-    return extract_endpoints_from_js_logic(file_or_url)
+    return extract_endpoints_from_js_logic(file_or_url, source_type=source_type)
 
 
 @mcp.tool()

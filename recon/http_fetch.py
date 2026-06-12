@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import re
+import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from recon.scope import ScopeError, assert_in_scope
+from recon.scope import (
+    DEFAULT_FETCH_HEADERS_METHOD,
+    DEFAULT_REQUEST_DELAY_MS,
+    DEFAULT_USER_AGENT,
+    ScopeError,
+    assert_in_scope,
+    load_scope,
+)
 
 
-USER_AGENT = "ReconMCP/0.1"
+USER_AGENT = DEFAULT_USER_AGENT
 TIMEOUT_SECONDS = 10.0
 MAX_REDIRECTS = 5
 SECURITY_HEADERS = [
@@ -40,7 +48,7 @@ def _client() -> httpx.Client:
     return httpx.Client(
         timeout=TIMEOUT_SECONDS,
         follow_redirects=False,
-        headers={"User-Agent": USER_AGENT},
+        headers={"User-Agent": get_user_agent()},
     )
 
 
@@ -49,12 +57,41 @@ def _error_result(url: str, message: str) -> dict:
     return {"ok": False, "url": url, "error": message}
 
 
-def _safe_get(client: httpx.Client, url: str) -> httpx.Response:
-    """GET a URL and validate every redirect target before following it."""
+def get_user_agent() -> str:
+    """Return the configured User-Agent with a safe default."""
+    return str(load_scope().get("user_agent") or DEFAULT_USER_AGENT)
+
+
+def get_request_delay_ms() -> int:
+    """Return the configured per-request delay in milliseconds."""
+    return max(0, int(load_scope().get("request_delay_ms", DEFAULT_REQUEST_DELAY_MS)))
+
+
+def get_fetch_headers_method() -> str:
+    """Return the configured header fetch method."""
+    method = str(load_scope().get("fetch_headers_method") or DEFAULT_FETCH_HEADERS_METHOD).upper()
+    return method if method in {"HEAD", "GET"} else DEFAULT_FETCH_HEADERS_METHOD
+
+
+def _request_delay() -> None:
+    """Apply the configured low-rate request delay."""
+    delay_ms = get_request_delay_ms()
+    if delay_ms:
+        time.sleep(delay_ms / 1000)
+
+
+def _safe_request(client: httpx.Client, method: str, url: str, *, headers_only: bool = False) -> httpx.Response:
+    """Request a URL and validate every redirect target before following it."""
     current_url = url
     for _ in range(MAX_REDIRECTS + 1):
         assert_in_scope(current_url)
-        response = client.get(current_url)
+        _request_delay()
+        if headers_only and method.upper() == "GET":
+            request = client.build_request("GET", current_url, headers={"Range": "bytes=0-0"})
+            response = client.send(request, stream=True)
+            response.close()
+        else:
+            response = client.request(method.upper(), current_url)
         if not response.is_redirect:
             return response
 
@@ -72,11 +109,40 @@ def _safe_get(client: httpx.Client, url: str) -> httpx.Response:
     raise ScopeError(f"Too many redirects; stopped after {MAX_REDIRECTS} redirects.")
 
 
+def _safe_get(client: httpx.Client, url: str) -> httpx.Response:
+    """GET a URL and validate every redirect target before following it."""
+    return _safe_request(client, "GET", url)
+
+
+def _safe_get_headers(client: httpx.Client, url: str) -> httpx.Response:
+    """GET a URL for headers without intentionally downloading a full body."""
+    return _safe_request(client, "GET", url, headers_only=True)
+
+
+def _safe_head(client: httpx.Client, url: str) -> httpx.Response:
+    """HEAD a URL and validate every redirect target before following it."""
+    return _safe_request(client, "HEAD", url)
+
+
 def fetch_headers(url: str) -> dict:
-    """Fetch response headers from an in-scope URL using GET."""
+    """Fetch response headers from an in-scope URL using HEAD with safe GET fallback."""
+    method_used = get_fetch_headers_method()
+    fallback_reason = None
     try:
         with _client() as client:
-            response = _safe_get(client, url)
+            if method_used == "HEAD":
+                try:
+                    response = _safe_head(client, url)
+                    if response.status_code in {403, 405}:
+                        fallback_reason = f"HEAD returned {response.status_code}"
+                        method_used = "GET"
+                        response = _safe_get_headers(client, url)
+                except httpx.HTTPError as exc:
+                    fallback_reason = f"HEAD request failed: {exc}"
+                    method_used = "GET"
+                    response = _safe_get_headers(client, url)
+            else:
+                response = _safe_get_headers(client, url)
     except ScopeError as exc:
         return _error_result(url, str(exc))
     except httpx.HTTPError as exc:
@@ -106,9 +172,11 @@ def fetch_headers(url: str) -> dict:
         "url": url,
         "final_url": str(response.url),
         "status_code": response.status_code,
+        "method": method_used,
         "headers": headers,
         "interesting_headers": interesting_headers,
         "notes": notes,
+        "fallback_reason": fallback_reason,
     }
 
 

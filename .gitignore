@@ -1,7 +1,8 @@
 __pycache__/
 .pytest_cache/
 .venv/
-output/
+output/*
+!output/.gitkeep
 *.pyc
 .env
 snapshots/

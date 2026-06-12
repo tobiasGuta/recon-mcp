@@ -1,12 +1,12 @@
 # recon-mcp
 
-`recon-mcp` is a local Python MCP server for safe, human-led bug bounty recon. It provides lightweight helpers for scope checks, headers, robots.txt, sitemap.xml, JavaScript URL collection, endpoint extraction, URL deduplication, evidence notes, and manual test planning.
+`recon-mcp` is a local Python MCP server for authorized, low-risk, human-led bug bounty recon. It provides lightweight helpers for scope checks, headers, robots.txt, sitemap.xml, JavaScript URL collection, endpoint extraction, URL deduplication, evidence notes, and manual test planning.
 
 This project complements a separate Go DirFuzz MCP server. It does not implement directory fuzzing in Python. For scope, it can use local JSON snapshots written by H1-Scope-Watcher as the source of truth.
 
 ## Safety Model
 
-This server is designed for authorized security testing only. Every network-facing Python tool checks configured scope before making requests. HTTP behavior is read-only, uses timeouts, and avoids custom attack payloads.
+This server is designed for authorized, low-risk security testing only. Every network-facing Python tool checks configured scope before making requests and before following redirect targets. HTTP behavior is read-only, uses timeouts and small request delays, and avoids custom attack payloads.
 
 It does not exploit vulnerabilities, bypass authentication, brute-force accounts, create accounts, perform login testing, send destructive requests, run high-volume scans, or scan outside configured scope.
 
@@ -33,6 +33,10 @@ Edit `config/scope.json`:
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
   "allowed_domains": [],
+  "user_agent": "ReconMCP/0.1",
+  "request_delay_ms": 500,
+  "max_requests_per_tool_call": 20,
+  "fetch_headers_method": "HEAD",
   "blocked_domains": [
     "localhost",
     "127.0.0.1",
@@ -45,6 +49,13 @@ Edit `config/scope.json`:
 Set `scope_source` to `h1_snapshots` to load local H1-Scope-Watcher JSON files on every scope check. New snapshots are picked up without restarting the MCP server. Set `scope_source` to `manual` to use `allowed_domains` instead.
 
 Exact domains and subdomains are allowed. For example, `api.example.com` matches `example.com`. H1 wildcard entries like `*.example.com` are normalized into host rules. Localhost, loopback, private IPs, link-local IPs, and blocked domains are rejected. If H1 snapshots are missing or invalid, scope checks fail closed.
+
+Request hygiene settings:
+
+- `user_agent` sets the User-Agent used by read-only HTTP helpers. The default is `ReconMCP/0.1`.
+- `request_delay_ms` adds a small delay before network requests. The default is `500`.
+- `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
+- `fetch_headers_method` defaults to `HEAD`. If `HEAD` is blocked or fails before useful headers are available, `fetch_headers` falls back to a safe `GET` that requests only the first byte and still checks scope before every redirect hop.
 
 ## H1-Scope-Watcher Snapshots
 

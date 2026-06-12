@@ -9,8 +9,8 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from bs4 import BeautifulSoup
 
-from recon.http_fetch import MAX_REDIRECTS, TIMEOUT_SECONDS, USER_AGENT
-from recon.scope import ScopeError, assert_in_scope, check_scope
+from recon.http_fetch import MAX_REDIRECTS, TIMEOUT_SECONDS, get_request_delay_ms, get_user_agent
+from recon.scope import DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, assert_in_scope, check_scope, load_scope
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,9 +31,14 @@ ENDPOINT_PATTERNS = {
 def _fetch_text(url: str) -> str:
     """Fetch text from an in-scope URL."""
     current_url = url
-    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
+    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"User-Agent": get_user_agent()}) as client:
         for _ in range(MAX_REDIRECTS + 1):
             assert_in_scope(current_url)
+            delay_ms = get_request_delay_ms()
+            if delay_ms:
+                import time
+
+                time.sleep(delay_ms / 1000)
             response = client.get(current_url)
             if not response.is_redirect:
                 response.raise_for_status()
@@ -52,6 +57,11 @@ def _fetch_text(url: str) -> str:
             current_url = next_url
 
     raise ScopeError(f"Too many redirects; stopped after {MAX_REDIRECTS} redirects.")
+
+
+def get_max_requests_per_tool_call() -> int:
+    """Return the configured per-tool request ceiling."""
+    return max(1, int(load_scope().get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL)))
 
 
 def _is_same_origin_or_in_scope(page_url: str, candidate_url: str) -> bool:
@@ -81,6 +91,13 @@ def collect_js_urls(url: str) -> dict:
         absolute_url = urljoin(url, src)
         if _is_same_origin_or_in_scope(url, absolute_url):
             js_urls.add(absolute_url)
+            if len(js_urls) > get_max_requests_per_tool_call():
+                return {
+                    "ok": False,
+                    "page_url": url,
+                    "error": "Too many JavaScript URLs collected for one tool call.",
+                    "max_requests_per_tool_call": get_max_requests_per_tool_call(),
+                }
 
     return {
         "ok": True,
@@ -90,20 +107,24 @@ def collect_js_urls(url: str) -> dict:
     }
 
 
-def _read_js_input(file_or_url: str) -> tuple[str, str]:
-    """Read JavaScript from a URL or local file path."""
-    if re.match(r"^https?://", file_or_url, flags=re.IGNORECASE):
-        return _fetch_text(file_or_url), "url"
-
+def _read_local_js_file(file_or_url: str) -> str:
+    """Read JavaScript from a restricted local file path."""
     path = Path(file_or_url).expanduser().resolve()
     if not path.is_relative_to(PROJECT_ROOT):
         raise OSError("Local JavaScript files must be inside the Recon MCP project directory.")
     if path.suffix.lower() not in ALLOWED_JS_SUFFIXES:
         raise OSError("Local JavaScript input must use a .js, .mjs, .cjs, or .map extension.")
     if path.stat().st_size > MAX_LOCAL_JS_BYTES:
-        raise OSError("Local JavaScript input is too large to read safely.")
+        raise OSError(f"Local JavaScript input exceeds MAX_LOCAL_JS_BYTES ({MAX_LOCAL_JS_BYTES}).")
 
-    return path.read_text(encoding="utf-8", errors="replace"), "file"
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _read_js_input(file_or_url: str) -> tuple[str, str]:
+    """Read JavaScript from a URL or local file path for backward compatibility."""
+    if re.match(r"^https?://", file_or_url, flags=re.IGNORECASE):
+        return _fetch_text(file_or_url), "url"
+    return _read_local_js_file(file_or_url), "file"
 
 
 def _categorize_endpoint(category: str, value: str) -> str:
@@ -117,13 +138,29 @@ def _categorize_endpoint(category: str, value: str) -> str:
     return category
 
 
-def extract_endpoints_from_js(file_or_url: str) -> dict:
+def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) -> dict:
     """Extract likely endpoints from a JavaScript URL, local file, or source string."""
     try:
-        if "\n" in file_or_url or "function " in file_or_url or "=>" in file_or_url:
-            js_text, source_type = file_or_url, "string"
+        if source_type is not None:
+            normalized_source_type = source_type.lower()
+            if normalized_source_type == "url":
+                js_text = _fetch_text(file_or_url)
+            elif normalized_source_type == "file":
+                js_text = _read_local_js_file(file_or_url)
+            elif normalized_source_type == "raw":
+                js_text = file_or_url
+            else:
+                return {
+                    "ok": False,
+                    "source": file_or_url,
+                    "source_type": source_type,
+                    "error": "source_type must be one of: url, file, raw.",
+                }
+            resolved_source_type = normalized_source_type
+        elif "\n" in file_or_url or "function " in file_or_url or "=>" in file_or_url:
+            js_text, resolved_source_type = file_or_url, "raw"
         else:
-            js_text, source_type = _read_js_input(file_or_url)
+            js_text, resolved_source_type = _read_js_input(file_or_url)
     except ScopeError as exc:
         return {"ok": False, "source": file_or_url, "error": str(exc)}
     except (OSError, httpx.HTTPError) as exc:
@@ -142,8 +179,8 @@ def extract_endpoints_from_js(file_or_url: str) -> dict:
     endpoints.sort(key=lambda item: (item["category"], item["value"]))
     return {
         "ok": True,
-        "source": file_or_url if source_type != "string" else "provided_string",
-        "source_type": source_type,
+        "source": file_or_url if resolved_source_type != "raw" else "provided_raw",
+        "source_type": resolved_source_type,
         "endpoints": endpoints,
         "count": len(endpoints),
         "notes": ["Possible endpoints require manual validation; no vulnerability is implied."],
