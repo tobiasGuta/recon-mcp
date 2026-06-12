@@ -1,0 +1,13 @@
+{
+  "scope_source": "h1_snapshots",
+  "h1_snapshot_dir": "D:/Tools/H1-Scope-Watcher/snapshots",
+  "include_only_bounty_eligible": false,
+  "include_only_submission_eligible": true,
+  "allowed_domains": [],
+  "blocked_domains": [
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1"
+  ]
+}
