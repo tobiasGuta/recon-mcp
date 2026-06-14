@@ -1,9 +1,38 @@
+# Python bytecode and caches
 __pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment files
 .venv/
-output/*
-!output/.gitkeep
-*.pyc
+venv/
+env/
 .env
+.env.*
+!.env.example
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local scope configuration and snapshots
+config/scope.json
 snapshots/
 *.jsonl
+
+# Generated recon output
+output/*
+!output/.gitkeep
+!output/**/.gitkeep
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

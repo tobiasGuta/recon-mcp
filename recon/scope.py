@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,6 +17,7 @@ DEFAULT_USER_AGENT = "ReconMCP/0.1"
 DEFAULT_REQUEST_DELAY_MS = 500
 DEFAULT_MAX_REQUESTS_PER_TOOL_CALL = 20
 DEFAULT_FETCH_HEADERS_METHOD = "HEAD"
+SUPPORTED_HOST_ASSET_TYPES = {"", "url", "domain", "wildcard", "api"}
 
 
 class ScopeError(ValueError):
@@ -60,9 +62,19 @@ def normalize_domain(value: str) -> str:
     if not raw:
         return ""
 
+    lowered = raw.lower()
+    if lowered.startswith("host:"):
+        raw = raw.split(":", 1)[1].strip()
+    elif lowered.startswith(":authority:"):
+        raw = raw.split(":", 1)[1].strip()
+
     parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="https")
     host = parsed.hostname or raw
-    return host.strip().rstrip(".").lower()
+    host = host.strip().strip("[]").rstrip(".").lower()
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
 
 
 def is_private_or_loopback_host(host: str) -> bool:
@@ -111,6 +123,176 @@ def _matches_allowed_host_rule(domain: str, host_rule: dict) -> bool:
     if host_rule.get("wildcard"):
         return domain != host and domain.endswith(f".{host}")
     return _matches_allowed_domain(domain, host)
+
+
+def _iso_from_timestamp(timestamp: float) -> str:
+    """Return a stable UTC ISO timestamp from a filesystem timestamp."""
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+def _scope_metadata(scope: dict, loaded: dict | None = None) -> dict:
+    """Build response metadata for the current scope snapshot/config."""
+    loaded = loaded or {}
+    entries = loaded.get("entries", [])
+    source_files = sorted({entry.get("_source_file") for entry in entries if entry.get("_source_file")})
+    generated_at = None
+    for source_file in source_files:
+        try:
+            modified_at = Path(source_file).stat().st_mtime
+        except OSError:
+            continue
+        generated_at = max(generated_at or modified_at, modified_at)
+
+    return {
+        "snapshot_directory": scope.get("h1_snapshot_dir") if scope.get("scope_source") == "h1_snapshots" else None,
+        "source_files": source_files,
+        "source_file": source_files[0] if len(source_files) == 1 else None,
+        "loaded_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _iso_from_timestamp(generated_at) if generated_at else None,
+        "total_assets_loaded": len(entries),
+        "warnings": loaded.get("warnings", []),
+    }
+
+
+def _with_metadata(result: dict, scope: dict, loaded: dict | None = None) -> dict:
+    """Attach snapshot metadata both top-level and under scope_metadata."""
+    metadata = _scope_metadata(scope, loaded)
+    result["scope_metadata"] = metadata
+    result.setdefault("snapshot_directory", metadata["snapshot_directory"])
+    result.setdefault("source_file", metadata["source_file"])
+    result.setdefault("loaded_at", metadata["loaded_at"])
+    result.setdefault("generated_at", metadata["generated_at"])
+    result.setdefault("total_assets_loaded", metadata["total_assets_loaded"])
+    result.setdefault("warnings", metadata["warnings"])
+    return result
+
+
+def _asset_type_supported(asset_type: object) -> bool:
+    """Return True when a scope entry describes a host-like asset."""
+    normalized = str(asset_type or "").strip().lower()
+    return normalized in SUPPORTED_HOST_ASSET_TYPES
+
+
+def _host_rule_match_type(normalized: str, item: dict) -> str | None:
+    """Return the match type for a normalized host against one host rule."""
+    host = item.get("host", "")
+    if item.get("wildcard"):
+        if normalized != host and normalized.endswith(f".{host}"):
+            return "wildcard"
+        return None
+    if normalized == host:
+        return "exact"
+    if normalized.endswith(f".{host}"):
+        return "parent_domain"
+    return None
+
+
+def _rank_match(match_type: str, item: dict) -> tuple[int, int]:
+    """Rank scope matches so exact assets win before wildcard and fallback parents."""
+    match_rank = {"exact": 0, "wildcard": 1, "parent_domain": 2}.get(match_type, 9)
+    host_depth = len(str(item.get("host") or "").split("."))
+    return (match_rank, -host_depth)
+
+
+def _reason_code_for_decision(decision: dict) -> str:
+    """Return a stable reason code for a scope decision."""
+    if not decision.get("in_scope"):
+        return decision.get("reason_code") or "no_matching_asset"
+    if not decision.get("submission_eligible"):
+        return "in_scope_not_submission_eligible"
+    if not decision.get("bounty_eligible"):
+        return "in_scope_not_bounty_eligible"
+    if decision.get("match_type") == "wildcard":
+        return "wildcard_scope_match"
+    return "in_scope_bounty_eligible"
+
+
+def _interop_payload(decision: dict) -> dict:
+    """Return stable keys for other local MCP servers."""
+    scope_ok = bool(decision.get("in_scope") and decision.get("submission_eligible"))
+    can_scan = bool(scope_ok and decision.get("bounty_eligible"))
+    risk_warning = "; ".join(decision.get("warnings") or []) or None
+    if decision.get("in_scope") and not decision.get("bounty_eligible"):
+        risk_warning = risk_warning or "In scope, but not bounty eligible."
+    if not decision.get("in_scope"):
+        risk_warning = risk_warning or decision.get("reason")
+
+    return {
+        "normalized_host": decision.get("normalized_host"),
+        "scope_ok": scope_ok,
+        "can_test": scope_ok,
+        "can_scan": can_scan,
+        "can_store_evidence": scope_ok,
+        "recommended_bugmap_target_label": decision.get("suggested_target_label"),
+        "risk_warning": risk_warning,
+    }
+
+
+def _decision_from_host_rule(input_value: str, normalized: str, item: dict, match_type: str, scope: dict, loaded: dict) -> dict:
+    """Create a rich scope decision from a matched host rule."""
+    exact_asset = item.get("original_asset_identifier") if match_type == "exact" else None
+    wildcard_asset = item.get("original_asset_identifier") if match_type == "wildcard" else None
+    source_file = item.get("source_file")
+    warnings = list(loaded.get("warnings", []))
+    if match_type == "wildcard":
+        warnings.append("Host matched a wildcard scope asset; confirm exact target ownership before linking evidence.")
+    if not _asset_type_supported(item.get("asset_type")):
+        warnings.append(f"Matched asset type may not be host-testable: {item.get('asset_type')}")
+
+    supported = _asset_type_supported(item.get("asset_type"))
+    submission_eligible = item.get("eligible_for_submission") is True
+    bounty_eligible = item.get("eligible_for_bounty") is True
+    in_scope = supported and submission_eligible
+    reason = "Exact in-scope host match from scope snapshot."
+    confidence = "high"
+    parent_strategy = "exact_host"
+    if match_type == "wildcard":
+        reason = "Wildcard in-scope host match from scope snapshot."
+        confidence = "medium"
+        parent_strategy = "wildcard_host"
+    elif match_type == "parent_domain":
+        reason = "Host is a subdomain of an in-scope host asset."
+        confidence = "medium"
+        parent_strategy = "program_fallback"
+    if not supported:
+        reason = "Matching asset uses an unsupported asset type for host testing."
+        confidence = "low"
+    elif not submission_eligible:
+        reason = "Matching asset is in scope but not submission eligible."
+        confidence = "low"
+    elif not bounty_eligible:
+        reason = "Matching asset is in scope for submission but not bounty eligible."
+
+    decision = {
+        "ok": True,
+        "input": input_value,
+        "normalized_host": normalized,
+        "domain": normalized,
+        "target": normalized,
+        "in_scope": in_scope,
+        "bounty_eligible": bounty_eligible,
+        "submission_eligible": submission_eligible,
+        "eligible_for_bounty": bounty_eligible,
+        "eligible_for_submission": submission_eligible,
+        "program_handle": item.get("program_handle"),
+        "max_severity": item.get("max_severity"),
+        "severity_allowed": item.get("max_severity") if in_scope else None,
+        "match_type": match_type,
+        "exact_matched_asset": exact_asset,
+        "wildcard_matched_asset": wildcard_asset,
+        "matched_scope": item.get("host"),
+        "asset_type": item.get("asset_type"),
+        "asset_identifier": item.get("original_asset_identifier"),
+        "suggested_target_label": normalized if match_type in {"exact", "wildcard"} else item.get("host"),
+        "suggested_parent_strategy": parent_strategy,
+        "confidence": confidence,
+        "scope_source": scope.get("scope_source", "h1_snapshots"),
+        "source_file": source_file,
+        "reason": reason,
+        "warnings": warnings,
+    }
+    decision["reason_code"] = _reason_code_for_decision(decision)
+    return _with_metadata(decision, scope, loaded)
 
 
 def _check_manual_scope(domain: str, normalized: str, scope: dict) -> dict:
@@ -167,59 +349,398 @@ def _load_h1_allowed_scope(scope: dict) -> dict:
 
 def _check_h1_scope(domain: str, normalized: str, scope: dict) -> dict:
     """Check a target against H1-Scope-Watcher snapshot scope."""
+    return resolve_scope_target(domain)
+
+
+def _resolve_manual_scope(input_value: str, normalized: str, scope: dict, response_format: str | None = None) -> dict:
+    """Resolve a host against manually configured scope."""
+    result = _check_manual_scope(input_value, normalized, scope)
+    result["normalized_host"] = normalized
+    result["bounty_eligible"] = bool(result.get("in_scope"))
+    result["submission_eligible"] = bool(result.get("in_scope"))
+    result["max_severity"] = None
+    result["severity_allowed"] = None
+    result["program_handle"] = None
+    result["match_type"] = "manual_domain" if result.get("in_scope") else "none"
+    result["exact_matched_asset"] = result.get("matched_scope") if result.get("in_scope") else None
+    result["wildcard_matched_asset"] = None
+    result["suggested_target_label"] = result.get("matched_scope") or normalized
+    result["suggested_parent_strategy"] = "manual_scope" if result.get("in_scope") else "none"
+    result["confidence"] = "medium" if result.get("in_scope") else "low"
+    result["reason_code"] = "in_scope_bounty_eligible" if result.get("in_scope") else "no_matching_asset"
+    result["warnings"] = result.get("warnings", [])
+    result = _with_metadata(result, scope, {"entries": [], "warnings": []})
+    if response_format == "mcp_interop":
+        result["mcp_interop"] = _interop_payload(result)
+    return result
+
+
+def _resolve_h1_scope(input_value: str, normalized: str, scope: dict, response_format: str | None = None) -> dict:
+    """Resolve a host against loaded H1 snapshot scope."""
     try:
         loaded = _load_h1_allowed_scope(scope)
     except H1ScopeError as exc:
-        return {
+        result = {
             "ok": False,
-            "input": domain,
+            "input": input_value,
+            "normalized_host": normalized,
             "domain": normalized,
             "target": normalized,
             "in_scope": False,
+            "bounty_eligible": False,
+            "submission_eligible": False,
+            "eligible_for_bounty": False,
+            "eligible_for_submission": False,
+            "program_handle": None,
+            "max_severity": None,
+            "severity_allowed": None,
+            "match_type": "none",
+            "exact_matched_asset": None,
+            "wildcard_matched_asset": None,
+            "suggested_target_label": normalized,
+            "suggested_parent_strategy": "none",
+            "confidence": "low",
             "scope_source": "h1_snapshots",
+            "reason_code": "scope_load_failed",
             "reason": str(exc),
+            "warnings": [str(exc)],
         }
+        result = _with_metadata(result, scope, {"entries": [], "warnings": [str(exc)]})
+        if response_format == "mcp_interop":
+            result["mcp_interop"] = _interop_payload(result)
+        return result
 
     allowed_hosts = loaded.get("allowed_hosts", [])
     if not allowed_hosts:
-        return {
+        result = {
             "ok": False,
-            "input": domain,
+            "input": input_value,
+            "normalized_host": normalized,
             "domain": normalized,
             "target": normalized,
             "in_scope": False,
+            "bounty_eligible": False,
+            "submission_eligible": False,
+            "eligible_for_bounty": False,
+            "eligible_for_submission": False,
+            "program_handle": None,
+            "max_severity": None,
+            "severity_allowed": None,
+            "match_type": "none",
+            "exact_matched_asset": None,
+            "wildcard_matched_asset": None,
+            "suggested_target_label": normalized,
+            "suggested_parent_strategy": "none",
+            "confidence": "low",
             "scope_source": "h1_snapshots",
+            "reason_code": "empty_scope",
             "reason": "H1 snapshot scope produced no allowed hosts; failing closed.",
+            "warnings": loaded.get("warnings", []),
         }
+        result = _with_metadata(result, scope, loaded)
+        if response_format == "mcp_interop":
+            result["mcp_interop"] = _interop_payload(result)
+        return result
 
+    matches = []
     for item in allowed_hosts:
-        host = item.get("host", "")
-        if _matches_allowed_host_rule(normalized, item):
-            return {
-                "ok": True,
-                "input": domain,
-                "domain": normalized,
-                "target": normalized,
-                "in_scope": True,
-                "matched_scope": host,
-                "scope_source": "h1_snapshots",
-                "program_handle": item.get("program_handle"),
-                "asset_type": item.get("asset_type"),
-                "eligible_for_bounty": item.get("eligible_for_bounty"),
-                "eligible_for_submission": item.get("eligible_for_submission"),
-                "max_severity": item.get("max_severity"),
-                "reason": "Target matches local H1 snapshot scope.",
-            }
+        match_type = _host_rule_match_type(normalized, item)
+        if match_type:
+            matches.append((match_type, item))
 
-    return {
+    if matches:
+        match_type, item = sorted(matches, key=lambda pair: _rank_match(pair[0], pair[1]))[0]
+        result = _decision_from_host_rule(input_value, normalized, item, match_type, scope, loaded)
+        if response_format == "mcp_interop":
+            result["mcp_interop"] = _interop_payload(result)
+        return result
+
+    result = {
         "ok": True,
-        "input": domain,
+        "input": input_value,
+        "normalized_host": normalized,
         "domain": normalized,
         "target": normalized,
         "in_scope": False,
+        "bounty_eligible": False,
+        "submission_eligible": False,
+        "eligible_for_bounty": False,
+        "eligible_for_submission": False,
+        "program_handle": None,
+        "max_severity": None,
+        "severity_allowed": None,
+        "match_type": "none",
+        "exact_matched_asset": None,
+        "wildcard_matched_asset": None,
+        "suggested_target_label": normalized,
+        "suggested_parent_strategy": "none",
+        "confidence": "low",
         "scope_source": "h1_snapshots",
+        "reason_code": "no_matching_asset",
         "reason": "No matching H1 scope entry found.",
+        "warnings": loaded.get("warnings", []),
     }
+    result = _with_metadata(result, scope, loaded)
+    if response_format == "mcp_interop":
+        result["mcp_interop"] = _interop_payload(result)
+    return result
+
+
+def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
+    """Resolve the best configured scope target for a host or URL."""
+    normalized = normalize_domain(host_or_url)
+    scope = load_scope()
+    scope_source = scope.get("scope_source", "manual")
+
+    if not normalized:
+        result = {
+            "ok": False,
+            "input": host_or_url,
+            "normalized_host": normalized,
+            "domain": normalized,
+            "target": normalized,
+            "in_scope": False,
+            "bounty_eligible": False,
+            "submission_eligible": False,
+            "eligible_for_bounty": False,
+            "eligible_for_submission": False,
+            "program_handle": None,
+            "max_severity": None,
+            "severity_allowed": None,
+            "match_type": "none",
+            "exact_matched_asset": None,
+            "wildcard_matched_asset": None,
+            "suggested_target_label": None,
+            "suggested_parent_strategy": "none",
+            "confidence": "low",
+            "scope_source": scope_source,
+            "reason_code": "missing_host",
+            "reason": "No domain or host was provided.",
+            "warnings": [],
+        }
+        result = _with_metadata(result, scope, {"entries": [], "warnings": []})
+        if format == "mcp_interop":
+            result["mcp_interop"] = _interop_payload(result)
+        return result
+
+    if is_blocked_domain(normalized):
+        result = {
+            "ok": True,
+            "input": host_or_url,
+            "normalized_host": normalized,
+            "domain": normalized,
+            "target": normalized,
+            "in_scope": False,
+            "bounty_eligible": False,
+            "submission_eligible": False,
+            "eligible_for_bounty": False,
+            "eligible_for_submission": False,
+            "program_handle": None,
+            "max_severity": None,
+            "severity_allowed": None,
+            "match_type": "none",
+            "exact_matched_asset": None,
+            "wildcard_matched_asset": None,
+            "suggested_target_label": normalized,
+            "suggested_parent_strategy": "none",
+            "confidence": "high",
+            "scope_source": scope_source,
+            "reason_code": "blocked_target",
+            "reason": "Target is blocked by safety rules or blocked_domains.",
+            "warnings": ["Target is blocked by safety rules or blocked_domains."],
+        }
+        result = _with_metadata(result, scope, {"entries": [], "warnings": result["warnings"]})
+        if format == "mcp_interop":
+            result["mcp_interop"] = _interop_payload(result)
+        return result
+
+    if scope_source == "h1_snapshots":
+        return _resolve_h1_scope(host_or_url, normalized, scope, format)
+    if scope_source == "manual":
+        return _resolve_manual_scope(host_or_url, normalized, scope, format)
+
+    result = {
+        "ok": False,
+        "input": host_or_url,
+        "normalized_host": normalized,
+        "domain": normalized,
+        "target": normalized,
+        "in_scope": False,
+        "bounty_eligible": False,
+        "submission_eligible": False,
+        "eligible_for_bounty": False,
+        "eligible_for_submission": False,
+        "program_handle": None,
+        "max_severity": None,
+        "severity_allowed": None,
+        "match_type": "none",
+        "exact_matched_asset": None,
+        "wildcard_matched_asset": None,
+        "suggested_target_label": normalized,
+        "suggested_parent_strategy": "none",
+        "confidence": "low",
+        "scope_source": scope_source,
+        "reason_code": "unsupported_scope_source",
+        "reason": f"Unsupported scope_source: {scope_source}",
+        "warnings": [f"Unsupported scope_source: {scope_source}"],
+    }
+    result = _with_metadata(result, scope, {"entries": [], "warnings": result["warnings"]})
+    if format == "mcp_interop":
+        result["mcp_interop"] = _interop_payload(result)
+    return result
+
+
+def check_scope_batch(hosts_or_urls: list[str], format: str | None = None) -> dict:
+    """Return one structured scope decision for each host or URL."""
+    return {
+        "ok": True,
+        "count": len(hosts_or_urls),
+        "results": [resolve_scope_target(item, format=format) for item in hosts_or_urls],
+    }
+
+
+def _scope_map_entry_from_allowed_host(item: dict) -> dict:
+    """Normalize an allowed host rule for machine consumption."""
+    host = item.get("host")
+    rule = item.get("rule") or host
+    return {
+        "asset_identifier": item.get("original_asset_identifier"),
+        "normalized_host": host,
+        "asset_type": item.get("asset_type"),
+        "eligible_for_bounty": item.get("eligible_for_bounty") is True,
+        "eligible_for_submission": item.get("eligible_for_submission") is True,
+        "program_handle": item.get("program_handle"),
+        "max_severity": item.get("max_severity"),
+        "scope_status": "in_scope" if item.get("eligible_for_submission") is True else "not_submission_eligible",
+        "source_file": item.get("source_file"),
+        "match_patterns": [rule],
+        "wildcard": item.get("wildcard") is True,
+        "supported": _asset_type_supported(item.get("asset_type")),
+    }
+
+
+def get_scope_map() -> dict:
+    """Return normalized machine-readable scope entries."""
+    scope = load_scope()
+    scope_source = scope.get("scope_source", "manual")
+    if scope_source == "manual":
+        entries = [
+            {
+                "asset_identifier": item,
+                "normalized_host": normalize_domain(item),
+                "asset_type": "manual",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+                "program_handle": None,
+                "max_severity": None,
+                "scope_status": "in_scope",
+                "source_file": None,
+                "match_patterns": [normalize_domain(item)],
+                "wildcard": False,
+                "supported": True,
+            }
+            for item in scope.get("allowed_domains", [])
+            if normalize_domain(item)
+        ]
+        result = {"ok": True, "scope_source": "manual", "entries": entries, "count": len(entries), "warnings": []}
+        return _with_metadata(result, scope, {"entries": [], "warnings": []})
+
+    if scope_source != "h1_snapshots":
+        result = {
+            "ok": False,
+            "scope_source": scope_source,
+            "entries": [],
+            "count": 0,
+            "warnings": [f"Unsupported scope_source: {scope_source}"],
+        }
+        return _with_metadata(result, scope, {"entries": [], "warnings": result["warnings"]})
+
+    try:
+        loaded = _load_h1_allowed_scope(scope)
+    except H1ScopeError as exc:
+        result = {"ok": False, "scope_source": "h1_snapshots", "entries": [], "count": 0, "warnings": [str(exc)]}
+        return _with_metadata(result, scope, {"entries": [], "warnings": [str(exc)]})
+
+    entries = [_scope_map_entry_from_allowed_host(item) for item in loaded.get("allowed_hosts", [])]
+    result = {
+        "ok": True,
+        "scope_source": "h1_snapshots",
+        "entries": entries,
+        "count": len(entries),
+        "warnings": loaded.get("warnings", []),
+    }
+    return _with_metadata(result, scope, loaded)
+
+
+def recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict]) -> dict:
+    """Recommend the best BugMap parent from current scope and provided targets."""
+    decision = resolve_scope_target(host_or_url)
+    normalized = decision.get("normalized_host") or ""
+    target_rows = [
+        {"id": item.get("id"), "label": str(item.get("label") or ""), "normalized_label": normalize_domain(str(item.get("label") or ""))}
+        for item in available_bugmap_targets
+        if isinstance(item, dict)
+    ]
+
+    def candidate_reason(row: dict) -> tuple[int, str] | None:
+        label = row["normalized_label"]
+        if label and label == normalized:
+            return (0, "exact target label")
+        suggested = normalize_domain(str(decision.get("suggested_target_label") or ""))
+        if label and suggested and label == suggested:
+            return (1, "resolved scope target label")
+        matched_scope = normalize_domain(str(decision.get("matched_scope") or ""))
+        if label and matched_scope and label == matched_scope:
+            return (2, "matched scope label")
+        program = str(decision.get("program_handle") or "").lower()
+        if row["label"].strip().lower() == program and program:
+            return (3, "program-level fallback")
+        if label and normalized.endswith(f".{label}"):
+            return (4, "parent domain fallback")
+        return None
+
+    candidates = []
+    for row in target_rows:
+        reason = candidate_reason(row)
+        if reason:
+            rank, text = reason
+            candidates.append({"rank": rank, "id": row["id"], "label": row["label"], "reason": text})
+
+    candidates.sort(key=lambda item: item["rank"])
+    selected = candidates[0] if candidates else None
+    alternatives = [{"id": item["id"], "label": item["label"], "reason": item["reason"]} for item in candidates[1:]]
+    warnings = list(decision.get("warnings") or [])
+    if not selected:
+        warnings.append("No available BugMap target matched the resolved scope decision.")
+
+    return {
+        "ok": selected is not None,
+        "input": host_or_url,
+        "normalized_host": normalized,
+        "recommended_parent_id": selected.get("id") if selected else None,
+        "recommended_parent_label": selected.get("label") if selected else None,
+        "alternatives": alternatives,
+        "match_type": decision.get("match_type"),
+        "reason": selected.get("reason") if selected else "No matching BugMap target was available.",
+        "warnings": warnings,
+        "scope_decision": decision,
+    }
+
+
+def explain_scope_decision(host_or_url: str) -> dict:
+    """Return a human-readable scope explanation plus the structured decision."""
+    decision = resolve_scope_target(host_or_url)
+    host = decision.get("normalized_host") or host_or_url
+    if decision.get("in_scope"):
+        source = Path(str(decision.get("source_file") or "")).name or "configured scope"
+        eligibility = "bounty-eligible" if decision.get("bounty_eligible") else "submission-eligible but not bounty-eligible"
+        explanation = (
+            f"{host} is in scope because it has a {decision.get('match_type')} match "
+            f"against a {eligibility} asset in {source}. Max severity: {decision.get('max_severity') or 'unspecified'}."
+        )
+    else:
+        explanation = f"{host} is not in scope: {decision.get('reason')}"
+    return {"ok": decision.get("ok", True), "explanation": explanation, **decision}
 
 
 def check_scope(domain: str) -> dict:
@@ -281,7 +802,7 @@ def list_loaded_scope() -> dict:
     if scope_source == "manual":
         allowed_domains = [normalize_domain(item) for item in scope.get("allowed_domains", []) if normalize_domain(item)]
         if not allowed_domains:
-            return {
+            result = {
                 "ok": False,
                 "scope_source": "manual",
                 "snapshot_directory": None,
@@ -292,7 +813,8 @@ def list_loaded_scope() -> dict:
                 "allowed_hosts": [],
                 "warnings": ["Manual scope has no allowed domains configured; failing closed."],
             }
-        return {
+            return _with_metadata(result, scope, {"entries": [], "warnings": result["warnings"]})
+        result = {
             "ok": True,
             "scope_source": "manual",
             "snapshot_directory": None,
@@ -303,6 +825,7 @@ def list_loaded_scope() -> dict:
             "allowed_hosts": sorted(set(allowed_domains)),
             "warnings": [],
         }
+        return _with_metadata(result, scope, {"entries": [], "warnings": []})
 
     if scope_source != "h1_snapshots":
         return {
@@ -332,7 +855,7 @@ def list_loaded_scope() -> dict:
     source_files = {entry.get("_source_file") for entry in entries if entry.get("_source_file")}
     program_handles = {entry.get("_program_handle") for entry in entries if entry.get("_program_handle")}
 
-    return {
+    result = {
         "ok": True,
         "scope_source": "h1_snapshots",
         "snapshot_directory": scope.get("h1_snapshot_dir"),
@@ -343,6 +866,7 @@ def list_loaded_scope() -> dict:
         "allowed_hosts": sorted({item.get("host") for item in allowed_hosts if item.get("host")}),
         "warnings": loaded.get("warnings", []),
     }
+    return _with_metadata(result, scope, loaded)
 
 
 def assert_in_scope(url_or_domain: str) -> None:

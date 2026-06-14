@@ -1,9 +1,11 @@
 {
-  "scope_source": "h1_snapshots",
-  "h1_snapshot_dir": "D:/Tools/H1-Scope-Watcher/snapshots",
+  "scope_source": "manual",
+  "h1_snapshot_dir": "",
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
-  "allowed_domains": [],
+  "allowed_domains": [
+    "example.com"
+  ],
   "user_agent": "ReconMCP/0.1",
   "request_delay_ms": 500,
   "max_requests_per_tool_call": 20,

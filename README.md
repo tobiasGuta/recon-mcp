@@ -24,15 +24,17 @@ python -m pip install -e ".[dev]"
 
 ## Configure Scope
 
-Edit `config/scope.json`:
+Create a local `config/scope.json` from `config/scope.example.json`, then edit it for your authorized target scope. The local `config/scope.json` file is ignored so personal snapshot paths and active program scope do not get pushed.
 
 ```json
 {
-  "scope_source": "h1_snapshots",
-  "h1_snapshot_dir": "D:/Tools/H1-Scope-Watcher/snapshots",
+  "scope_source": "manual",
+  "h1_snapshot_dir": "",
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
-  "allowed_domains": [],
+  "allowed_domains": [
+    "example.com"
+  ],
   "user_agent": "ReconMCP/0.1",
   "request_delay_ms": 500,
   "max_requests_per_tool_call": 20,
@@ -59,7 +61,7 @@ Request hygiene settings:
 
 ## H1-Scope-Watcher Snapshots
 
-This project does not call the HackerOne API. H1-Scope-Watcher should fetch program scope and write plain JSON snapshots to disk.
+This project does not call any bug bounty platform API directly. H1-Scope-Watcher should fetch program scope and write plain JSON snapshots to disk.
 
 When running H1-Scope-Watcher in Docker on Windows, use a bind mount so snapshots are visible on the host:
 
@@ -123,6 +125,11 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 
 - `health()`
 - `check_scope(domain: str)`
+- `resolve_scope_target(host_or_url: str, format: str | None = None)`
+- `check_scope_batch(hosts_or_urls: list[str], format: str | None = None)`
+- `get_scope_map()`
+- `recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict])`
+- `explain_scope_decision(host_or_url: str)`
 - `list_loaded_scope()`
 - `fetch_headers(url: str)`
 - `fetch_robots(url: str)`

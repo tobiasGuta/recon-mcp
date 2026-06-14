@@ -13,7 +13,12 @@ from recon.js_analysis import extract_endpoints_from_js as extract_endpoints_fro
 from recon.notes import create_evidence_note as create_evidence_note_logic
 from recon.planner import generate_manual_test_plan as generate_manual_test_plan_logic
 from recon.scope import check_scope as check_scope_logic
+from recon.scope import check_scope_batch as check_scope_batch_logic
+from recon.scope import explain_scope_decision as explain_scope_decision_logic
+from recon.scope import get_scope_map as get_scope_map_logic
 from recon.scope import list_loaded_scope as list_loaded_scope_logic
+from recon.scope import recommend_bugmap_parent as recommend_bugmap_parent_logic
+from recon.scope import resolve_scope_target as resolve_scope_target_logic
 from recon.urls import dedupe_urls as dedupe_urls_logic
 
 
@@ -22,6 +27,11 @@ mcp = FastMCP("recon-mcp")
 AVAILABLE_TOOLS = [
     "health",
     "check_scope",
+    "resolve_scope_target",
+    "check_scope_batch",
+    "get_scope_map",
+    "recommend_bugmap_parent",
+    "explain_scope_decision",
     "list_loaded_scope",
     "fetch_headers",
     "fetch_robots",
@@ -52,6 +62,36 @@ def health() -> dict:
 def check_scope(domain: str) -> dict:
     """Safely check whether a domain or URL is authorized by configured recon scope."""
     return check_scope_logic(domain)
+
+
+@mcp.tool()
+def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
+    """Resolve the best configured scope target for a host or URL."""
+    return resolve_scope_target_logic(host_or_url, format=format)
+
+
+@mcp.tool()
+def check_scope_batch(hosts_or_urls: list[str], format: str | None = None) -> dict:
+    """Return one structured scope decision per host or URL."""
+    return check_scope_batch_logic(hosts_or_urls, format=format)
+
+
+@mcp.tool()
+def get_scope_map() -> dict:
+    """Return normalized machine-readable scope entries."""
+    return get_scope_map_logic()
+
+
+@mcp.tool()
+def recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict]) -> dict:
+    """Recommend the best BugMap parent from current scope and provided targets."""
+    return recommend_bugmap_parent_logic(host_or_url, available_bugmap_targets)
+
+
+@mcp.tool()
+def explain_scope_decision(host_or_url: str) -> dict:
+    """Explain a scope decision in human-readable and structured form."""
+    return explain_scope_decision_logic(host_or_url)
 
 
 @mcp.tool()

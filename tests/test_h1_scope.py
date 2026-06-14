@@ -5,7 +5,14 @@ from recon.h1_scope import (
     load_h1_snapshots,
     normalise_h1_asset_identifier,
 )
-from recon.scope import check_scope
+from recon.scope import (
+    check_scope,
+    check_scope_batch,
+    explain_scope_decision,
+    get_scope_map,
+    recommend_bugmap_parent,
+    resolve_scope_target,
+)
 
 
 def write_snapshot(tmp_path, handle, entries):
@@ -158,3 +165,208 @@ def test_empty_snapshot_file_fails_closed(tmp_path, monkeypatch):
     assert result["ok"] is False
     assert result["in_scope"] is False
     assert "no usable scope entries" in result["reason"].lower()
+
+
+def test_resolve_scope_target_exact_host_match(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "URL",
+                "asset_identifier": "api.example.com",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+                "max_severity": "critical",
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("api.example.com")
+
+    assert result["in_scope"] is True
+    assert result["bounty_eligible"] is True
+    assert result["submission_eligible"] is True
+    assert result["program_handle"] == "program"
+    assert result["match_type"] == "exact"
+    assert result["exact_matched_asset"] == "api.example.com"
+    assert result["reason_code"] == "in_scope_bounty_eligible"
+    assert result["scope_metadata"]["total_assets_loaded"] == 1
+
+
+def test_resolve_scope_target_wildcard_match(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "WILDCARD",
+                "asset_identifier": "*.example.com",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("api.example.com")
+
+    assert result["in_scope"] is True
+    assert result["match_type"] == "wildcard"
+    assert result["wildcard_matched_asset"] == "*.example.com"
+    assert result["confidence"] == "medium"
+
+
+def test_resolve_scope_target_non_bounty_eligible_wildcard(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "WILDCARD",
+                "asset_identifier": "*.example.com",
+                "eligible_for_bounty": False,
+                "eligible_for_submission": True,
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("api.example.com")
+
+    assert result["in_scope"] is True
+    assert result["bounty_eligible"] is False
+    assert result["reason_code"] == "in_scope_not_bounty_eligible"
+
+
+def test_resolve_scope_target_out_of_scope_reason_code(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [{"asset_type": "URL", "asset_identifier": "example.com", "eligible_for_submission": True}],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("outside.test")
+
+    assert result["in_scope"] is False
+    assert result["reason_code"] == "no_matching_asset"
+    assert result["severity_allowed"] is None
+
+
+def test_resolve_scope_target_url_port_and_uppercase_normalization(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [{"asset_type": "URL", "asset_identifier": "api.example.com", "eligible_for_submission": True}],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("https://API.Example.com:8443/path?q=1")
+
+    assert result["normalized_host"] == "api.example.com"
+    assert result["match_type"] == "exact"
+
+
+def test_recommend_bugmap_parent_prefers_exact_host(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "URL",
+                "asset_identifier": "api.example.com",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = recommend_bugmap_parent(
+        "api.example.com",
+        [
+            {"id": "root", "label": "program"},
+            {"id": "api", "label": "api.example.com"},
+            {"id": "other", "label": "other.example.com"},
+        ],
+    )
+
+    assert result["recommended_parent_id"] == "api"
+    assert result["recommended_parent_label"] == "api.example.com"
+
+
+def test_check_scope_batch_returns_structured_results(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [{"asset_type": "URL", "asset_identifier": "one.example.com", "eligible_for_submission": True}],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = check_scope_batch(["one.example.com", "two.example.com"])
+
+    assert result["count"] == 2
+    assert result["results"][0]["in_scope"] is True
+    assert result["results"][1]["reason_code"] == "no_matching_asset"
+
+
+def test_get_scope_map_returns_normalized_entries(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "URL",
+                "asset_identifier": "https://api.example.com/path",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+                "max_severity": "high",
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = get_scope_map()
+
+    assert result["ok"] is True
+    assert result["entries"][0]["normalized_host"] == "api.example.com"
+    assert result["entries"][0]["program_handle"] == "program"
+    assert result["entries"][0]["match_patterns"] == ["api.example.com"]
+
+
+def test_explain_scope_decision_includes_human_text(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [{"asset_type": "URL", "asset_identifier": "api.example.com", "eligible_for_submission": True}],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = explain_scope_decision("api.example.com")
+
+    assert "api.example.com is in scope" in result["explanation"]
+    assert result["normalized_host"] == "api.example.com"
+
+
+def test_resolve_scope_target_mcp_interop_format(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "program",
+        [
+            {
+                "asset_type": "URL",
+                "asset_identifier": "api.example.com",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+            }
+        ],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    result = resolve_scope_target("api.example.com", format="mcp_interop")
+
+    assert result["mcp_interop"]["scope_ok"] is True
+    assert result["mcp_interop"]["can_scan"] is True
+    assert result["mcp_interop"]["recommended_bugmap_target_label"] == "api.example.com"
