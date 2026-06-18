@@ -66,6 +66,36 @@ Negative-result memory is stored in `memory/negative_results.jsonl`. These recor
 
 The hallucination bin is intentional. It keeps AI-assisted or speculative leads separate until a human validates scope, evidence, reproducibility, impact, and safety.
 
+## Source Map Recon
+
+Source maps can reveal original frontend source files, routes, API paths, GraphQL usage, environment names, feature flags, client configuration, and source file names. These are recon leads, not vulnerabilities by themselves.
+
+Recon MCP handles source maps inside a campaign with a safe, explicit workflow:
+
+- Fetch JavaScript through the existing scope-checked HTTP helpers.
+- Detect `sourceMappingURL` references without downloading by default.
+- Resolve and scope-check every source map URL.
+- Skip out-of-scope source map URLs instead of fetching them.
+- Download only bounded, in-scope source map JSON.
+- Extract embedded `sourcesContent` locally inside the campaign folder.
+- Analyze extracted files for endpoint candidates and manual-review signals.
+- Redact likely sensitive values in previews.
+
+Recon MCP does not use unsafe remote external modes such as `sourcemapper -jsurl https://target/app.js` or `sourcemapper -url https://target/app.js.map`. External sourcemapper, if used later, must be local-file-only: it should accept only `.map` files already stored inside the campaign and write only inside the campaign extracted folder. No cookies, Authorization headers, tokens, custom auth headers, or remote URLs are passed to external tools. No reports are auto-submitted.
+
+Source map workflow:
+
+1. `create_campaign`
+2. `collect_js_urls_for_campaign`
+3. `detect_sourcemap_references_for_campaign`
+4. `download_sourcemap_for_campaign`
+5. `extract_sourcemap_sources_for_campaign`
+6. `analyze_sourcemap_sources_for_campaign`
+7. `generate_manual_test_plan_for_campaign`
+8. `create_finding_candidate` only if manual validation suggests a real issue
+9. `promote_finding` only after impact is proven
+10. `generate_campaign_summary`
+
 ## Installation
 
 Use Python 3.11 or newer.
@@ -218,6 +248,12 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `generate_manual_test_plan_for_campaign(campaign_id: str)`
 - `generate_campaign_summary(campaign_id: str)`
 - `generate_report_candidate_markdown(campaign_id: str, finding_id: str)`
+- `detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str)`
+- `download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str)`
+- `extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str)`
+- `analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
+- `sourcemap_workflow_for_campaign(campaign_id: str, js_url: str)`
+- `external_sourcemapper_info()`
 
 ## Legacy Example Workflow
 
@@ -259,6 +295,7 @@ recon-mcp/
 │   ├── findings.py
 │   ├── endpoint_scoring.py
 │   ├── memory.py
+│   ├── sourcemaps.py
 │   └── reports.py
 ├── output/
 │   ├── logs/

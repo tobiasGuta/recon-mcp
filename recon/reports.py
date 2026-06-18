@@ -44,6 +44,39 @@ def _all_scored_endpoints(paths: dict) -> list[dict]:
     return endpoints
 
 
+def _sourcemap_summary(paths: dict) -> dict:
+    analysis_dir = Path(paths["recon"]["sourcemaps"]) / "analysis"
+    result = {
+        "detected_maps": 0,
+        "downloaded_maps": 0,
+        "extracted_dirs": [],
+        "top_endpoints": [],
+        "signals": [],
+        "warnings": [],
+    }
+    if not analysis_dir.exists():
+        return result
+    endpoints = []
+    for item in _load_json_files(analysis_dir):
+        path = Path(item["path"])
+        payload = item["payload"]
+        if "sourcemap-detect" in path.name:
+            result["detected_maps"] += len(payload.get("references", []))
+        elif "download" in path.name and payload.get("ok"):
+            result["downloaded_maps"] += 1
+        elif "extract" in path.name and payload.get("extracted_dir"):
+            result["extracted_dirs"].append(payload["extracted_dir"])
+        elif "source-analysis" in path.name:
+            endpoints.extend(payload.get("scored_endpoints", []))
+            result["signals"].extend(payload.get("signals", []))
+            result["warnings"].extend(payload.get("warnings", []))
+    endpoints.sort(key=lambda endpoint: (-endpoint.get("score", 0), endpoint.get("value", "")))
+    result["top_endpoints"] = endpoints[:20]
+    result["signals"] = result["signals"][:50]
+    result["warnings"] = sorted(set(result["warnings"]))
+    return result
+
+
 def _audit_tools(paths: dict) -> list[str]:
     audit_path = Path(paths["audit_jsonl"])
     tools = []
@@ -72,8 +105,9 @@ def generate_campaign_markdown_summary(campaign_id: str) -> dict:
     findings = list_findings(campaign_id).get("findings", [])
     negatives = list_negative_results(campaign_id).get("results", [])
     endpoints = _all_scored_endpoints(paths)[:20]
+    sourcemaps = _sourcemap_summary(paths)
     artifact_counts = {
-        name: len(list(Path(directory).glob("*.json")))
+        name: len(list(Path(directory).rglob("*.json"))) if name == "sourcemaps" else len(list(Path(directory).glob("*.json")))
         for name, directory in paths["recon"].items()
     }
     by_status: dict[str, int] = {}
@@ -102,6 +136,20 @@ def generate_campaign_markdown_summary(campaign_id: str) -> dict:
 
 ## Top Endpoint Candidates by Score
 {_md([f"{item['score']} {item['priority']}: {item['value']}" for item in endpoints])}
+
+## Source Map Recon
+- **Detected maps:** {sourcemaps["detected_maps"]}
+- **Downloaded maps:** {sourcemaps["downloaded_maps"]}
+- **Extracted source directories:** {len(sourcemaps["extracted_dirs"])}
+
+### Top Source Map Endpoint Candidates
+{_md([f"{item['score']} {item['priority']}: {item['value']}" for item in sourcemaps["top_endpoints"]])}
+
+### Manual-Review Source Map Signals
+{_md([f"{item.get('type')} in {Path(item.get('file', '')).name}:{item.get('line')} - {item.get('preview')}" for item in sourcemaps["signals"][:20]])}
+
+### Source Map Safety Warnings
+{_md(sourcemaps["warnings"] + ["Exposed source maps are recon leads, not vulnerabilities by themselves.", "Validate impact manually before creating or promoting findings."])}
 
 ## Findings by Status
 {_md(by_status)}

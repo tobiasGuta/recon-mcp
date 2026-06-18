@@ -16,6 +16,10 @@ from recon.scope import DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, check_sc
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_JS_SUFFIXES = {".js", ".mjs", ".cjs", ".map"}
 MAX_LOCAL_JS_BYTES = 2 * 1024 * 1024
+SOURCE_MAPPING_URL_PATTERN = re.compile(
+    r"""(?:\/\/[#@]\s*sourceMappingURL=|\/\*[#@]\s*sourceMappingURL=|sourceMappingURL=)(?P<value>[^\s*]+)""",
+    flags=re.IGNORECASE,
+)
 
 ENDPOINT_PATTERNS = {
     "api": re.compile(r"""(?P<value>/(?:api|v1|v2)/[A-Za-z0-9_./?=&%:-]*)"""),
@@ -24,7 +28,7 @@ ENDPOINT_PATTERNS = {
     "admin": re.compile(r"""(?P<value>/admin/[A-Za-z0-9_./?=&%:-]*)"""),
     "full_url": re.compile(r"""(?P<value>https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)"""),
     "relative_route": re.compile(r"""["'`](?P<value>/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{2,})["'`]"""),
-    "source_map": re.compile(r"""sourceMappingURL=(?P<value>[^\s]+)"""),
+    "source_map": SOURCE_MAPPING_URL_PATTERN,
 }
 
 
@@ -110,6 +114,47 @@ def _categorize_endpoint(category: str, value: str) -> str:
     if category == "relative_route":
         return "relative_route"
     return category
+
+
+def parse_sourcemap_references(js_text: str, js_url: str | None = None) -> list[dict]:
+    """Parse sourceMappingURL comments without downloading anything."""
+    references = []
+    seen = set()
+    for match in SOURCE_MAPPING_URL_PATTERN.finditer(js_text or ""):
+        raw = match.group("value").strip().strip("'\"").rstrip("*/")
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        lowered = raw.lower()
+        resolved_url = None
+        if lowered.startswith("data:"):
+            kind = "data_uri"
+            reason = "inline data URI source map; manual review only"
+            safe_to_download = False
+        elif lowered.startswith(("http://", "https://")):
+            kind = "absolute"
+            resolved_url = raw
+            reason = "absolute source map URL"
+            safe_to_download = True
+        elif js_url:
+            kind = "relative"
+            resolved_url = urljoin(js_url, raw)
+            reason = "relative source map resolved against JS URL"
+            safe_to_download = True
+        else:
+            kind = "unknown"
+            reason = "relative source map cannot be resolved without js_url"
+            safe_to_download = False
+        references.append(
+            {
+                "raw": raw,
+                "kind": kind,
+                "resolved_url": resolved_url,
+                "safe_to_download": safe_to_download,
+                "reason": reason,
+            }
+        )
+    return references
 
 
 def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) -> dict:

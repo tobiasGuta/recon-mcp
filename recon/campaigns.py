@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "campaigns"
 SAFETY_MODEL = "authorized_low_risk_human_led"
 CAMPAIGN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,159}$")
-RECON_SUBDIRS = ["headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz"]
+RECON_SUBDIRS = ["headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz", "sourcemaps"]
 FINDING_SUBDIRS = [
     "hallucinations",
     "needs_manual_validation",
@@ -121,6 +121,8 @@ def _create_layout(root: Path) -> str | None:
         (root / "recon").mkdir()
         for name in RECON_SUBDIRS:
             (root / "recon" / name).mkdir()
+        for name in ("maps", "extracted", "analysis"):
+            (root / "recon" / "sourcemaps" / name).mkdir()
         (root / "findings").mkdir()
         for name in FINDING_SUBDIRS:
             (root / "findings" / name).mkdir()

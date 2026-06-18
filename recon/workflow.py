@@ -15,6 +15,11 @@ from recon.memory import list_negative_results
 from recon.planner import generate_manual_test_plan
 from recon.reports import generate_campaign_markdown_summary
 from recon.scope import resolve_scope_target
+from recon.sourcemaps import analyze_sourcemap_sources_for_campaign
+from recon.sourcemaps import detect_sourcemap_references_for_campaign
+from recon.sourcemaps import download_sourcemap_for_campaign
+from recon.sourcemaps import extract_sourcemap_sources_for_campaign
+from recon.sourcemaps import sourcemap_workflow_for_campaign
 
 
 def _error(message: str) -> dict:
@@ -150,6 +155,32 @@ def _load_artifacts(campaign_id: str) -> dict:
     return artifacts
 
 
+def _load_sourcemap_analysis(campaign_id: str) -> dict:
+    paths = get_campaign_paths(campaign_id)
+    if not paths.get("ok"):
+        return {"detections": [], "downloads": [], "extractions": [], "analyses": []}
+    sourcemap_root = Path(paths["paths"]["recon"]["sourcemaps"])
+    analysis_dir = sourcemap_root / "analysis"
+    result = {"detections": [], "downloads": [], "extractions": [], "analyses": []}
+    if not analysis_dir.exists():
+        return result
+    for path in sorted(analysis_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        name = path.name
+        if "sourcemap-detect" in name:
+            result["detections"].append(payload)
+        elif "download" in name:
+            result["downloads"].append(payload)
+        elif "extract" in name:
+            result["extractions"].append(payload)
+        elif "source-analysis" in name:
+            result["analyses"].append(payload)
+    return result
+
+
 def _campaign_summary_input(campaign_id: str) -> dict:
     campaign = get_campaign(campaign_id).get("campaign", {})
     artifacts = _load_artifacts(campaign_id)
@@ -162,6 +193,15 @@ def _campaign_summary_input(campaign_id: str) -> dict:
         js_urls.extend(item.get("result", {}).get("js_urls", []))
     for item in artifacts.get("headers", []):
         interesting_headers.update(item.get("result", {}).get("interesting_headers", {}))
+    sourcemaps = _load_sourcemap_analysis(campaign_id)
+    sourcemap_endpoints = []
+    sourcemap_signals = []
+    sourcemap_warnings = []
+    for analysis in sourcemaps["analyses"]:
+        sourcemap_endpoints.extend(analysis.get("scored_endpoints", []))
+        sourcemap_signals.extend(analysis.get("signals", []))
+        sourcemap_warnings.extend(analysis.get("warnings", []))
+    endpoints.extend(sourcemap_endpoints)
     endpoints.sort(key=lambda item: (-item.get("score", 0), item.get("value", "")))
     return {
         "campaign": campaign,
@@ -169,6 +209,16 @@ def _campaign_summary_input(campaign_id: str) -> dict:
         "js_urls": js_urls,
         "interesting_headers": interesting_headers,
         "negative_results": list_negative_results(campaign_id).get("results", []),
+        "sourcemaps": {
+            "detected": sum(len(item.get("references", [])) for item in sourcemaps["detections"]),
+            "downloaded": len(sourcemaps["downloads"]),
+            "extracted": len(sourcemaps["extractions"]),
+            "files_analyzed": sum(item.get("files_analyzed", 0) for item in sourcemaps["analyses"]),
+            "top_endpoints": sourcemap_endpoints[:20],
+            "signals": sourcemap_signals[:50],
+            "signals_count": len(sourcemap_signals),
+            "warnings": sorted(set(sourcemap_warnings)),
+        },
     }
 
 
@@ -180,10 +230,22 @@ def generate_manual_test_plan_for_campaign(campaign_id: str) -> dict:
     summary = _campaign_summary_input(campaign_id)
     plan = generate_manual_test_plan(summary)
     top_endpoints = summary["endpoints"][:20]
+    sourcemaps = summary["sourcemaps"]
     negatives = summary["negative_results"]
     content = "# Manual Test Plan\n\n"
     content += "## Priority Items\n" + "\n".join(f"- {item}" for item in plan.get("priority_items", [])) + "\n\n"
     content += "## Top Endpoint Candidates\n" + ("\n".join(f"- {item['score']} {item['priority']}: {item['value']}" for item in top_endpoints) or "- None.") + "\n\n"
+    content += "## Source Map Endpoint Candidates\n" + (
+        "\n".join(f"- {item['score']} {item['priority']}: {item['value']}" for item in sourcemaps["top_endpoints"])
+        or "- None."
+    ) + "\n\n"
+    content += "## Source Map Signals\n" + (
+        "\n".join(f"- {item.get('type')} in {Path(item.get('file', '')).name}:{item.get('line')}: {item.get('preview')}" for item in sourcemaps["signals"][:20])
+        or "- None."
+    ) + "\n\n"
+    content += "## Source Map Safety Notes\n"
+    content += "- Exposed source maps are recon leads, not vulnerabilities by themselves.\n"
+    content += "- Validate scope, exposure, exploitability, and impact manually before creating findings.\n\n"
     content += "## Negative Results\n" + ("\n".join(f"- {item.get('check_type')}: {item.get('result')}" for item in negatives) or "- None recorded.") + "\n\n"
     content += "## Checklist\n" + "\n".join(f"- {item}" for item in plan.get("checklist", [])) + "\n\n"
     content += "## DirFuzz Handoff\n" + "\n".join(f"- {item}" for item in plan.get("dirfuzz_handoff", [])) + "\n"

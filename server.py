@@ -34,6 +34,12 @@ from recon.scope import get_scope_map as get_scope_map_logic
 from recon.scope import list_loaded_scope as list_loaded_scope_logic
 from recon.scope import recommend_bugmap_parent as recommend_bugmap_parent_logic
 from recon.scope import resolve_scope_target as resolve_scope_target_logic
+from recon.sourcemaps import analyze_sourcemap_sources_for_campaign as analyze_sourcemap_sources_for_campaign_logic
+from recon.sourcemaps import detect_sourcemap_references_for_campaign as detect_sourcemap_references_for_campaign_logic
+from recon.sourcemaps import download_sourcemap_for_campaign as download_sourcemap_for_campaign_logic
+from recon.sourcemaps import external_sourcemapper_info as external_sourcemapper_info_logic
+from recon.sourcemaps import extract_sourcemap_sources_for_campaign as extract_sourcemap_sources_for_campaign_logic
+from recon.sourcemaps import sourcemap_workflow_for_campaign as sourcemap_workflow_for_campaign_logic
 from recon.urls import dedupe_urls as dedupe_urls_logic
 from recon.workflow import collect_js_urls_for_campaign as collect_js_urls_for_campaign_logic
 from recon.workflow import extract_endpoints_for_campaign as extract_endpoints_for_campaign_logic
@@ -88,6 +94,12 @@ AVAILABLE_TOOLS = [
     "generate_manual_test_plan_for_campaign",
     "generate_campaign_summary",
     "generate_report_candidate_markdown",
+    "detect_sourcemap_references_for_campaign",
+    "download_sourcemap_for_campaign",
+    "extract_sourcemap_sources_for_campaign",
+    "analyze_sourcemap_sources_for_campaign",
+    "sourcemap_workflow_for_campaign",
+    "external_sourcemapper_info",
 ]
 
 
@@ -364,6 +376,42 @@ def generate_campaign_summary(campaign_id: str) -> dict:
 def generate_report_candidate_markdown(campaign_id: str, finding_id: str) -> dict:
     """Generate local report Markdown for authorized, human-led testing only; no submission occurs."""
     return generate_report_candidate_markdown_logic(campaign_id, finding_id)
+
+
+@mcp.tool()
+def detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str) -> dict:
+    """Detect in-scope source map references for authorized, human-led testing only."""
+    return detect_sourcemap_references_for_campaign_logic(campaign_id, js_url)
+
+
+@mcp.tool()
+def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dict:
+    """Download an in-scope source map for authorized, human-led testing only."""
+    return download_sourcemap_for_campaign_logic(campaign_id, sourcemap_url)
+
+
+@mcp.tool()
+def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> dict:
+    """Extract local source map sources for authorized, human-led testing only."""
+    return extract_sourcemap_sources_for_campaign_logic(campaign_id, map_path)
+
+
+@mcp.tool()
+def analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
+    """Analyze extracted source map files for manual-review leads only."""
+    return analyze_sourcemap_sources_for_campaign_logic(campaign_id, extracted_dir=extracted_dir)
+
+
+@mcp.tool()
+def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
+    """Run safe source map recon for an in-scope campaign JS URL only."""
+    return sourcemap_workflow_for_campaign_logic(campaign_id, js_url)
+
+
+@mcp.tool()
+def external_sourcemapper_info() -> dict:
+    """Explain safe local-only external sourcemapper usage; does not execute it."""
+    return external_sourcemapper_info_logic()
 
 
 if __name__ == "__main__":
