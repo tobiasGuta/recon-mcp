@@ -1,6 +1,15 @@
 import httpx
 
-from recon.http_fetch import fetch_headers, get_request_delay_ms
+from recon.http_fetch import (
+    MAX_ROBOTS_BYTES,
+    MAX_SITEMAP_BYTES,
+    fetch_headers,
+    fetch_robots,
+    fetch_sitemap,
+    get_request_delay_ms,
+    safe_get_text,
+)
+from recon.scope import ScopeError
 
 
 def scoped_config(**overrides):
@@ -155,3 +164,108 @@ def test_fetch_headers_blocks_out_of_scope_redirect_during_get_fallback(monkeypa
     assert result["ok"] is False
     assert "redirect blocked" in result["error"].lower()
     assert requested == [("HEAD", "https://example.com/"), ("GET", "https://example.com/")]
+
+
+def test_fetch_robots_truncates_large_body(monkeypatch):
+    large_body = b"Disallow: /private\n" + (b"A" * (MAX_ROBOTS_BYTES + 1))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=large_body)
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = fetch_robots("https://example.com/")
+
+    assert result["ok"] is True
+    assert result["content_truncated"] is True
+    assert len(result["content_preview"]) <= 2000
+    assert result["disallow"] == ["/private"]
+
+
+def test_fetch_sitemap_rejects_oversized_body(monkeypatch):
+    large_body = b"<urlset>" + (b"A" * (MAX_SITEMAP_BYTES + 1)) + b"</urlset>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=large_body)
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = fetch_sitemap("https://example.com/")
+
+    assert result["ok"] is True
+    assert result["content_truncated"] is True
+    assert result["parse_error"] == "Response too large to parse."
+    assert result["discovered_urls"] == []
+
+
+def test_fetch_robots_out_of_scope_url_is_rejected(monkeypatch):
+    patch_scope(monkeypatch)
+
+    result = fetch_robots("https://evil.test/")
+
+    assert result["ok"] is False
+    assert "out of scope" in result["error"].lower() or "does not match" in result["error"].lower()
+
+
+def test_fetch_sitemap_out_of_scope_url_is_rejected(monkeypatch):
+    patch_scope(monkeypatch)
+
+    result = fetch_sitemap("https://evil.test/")
+
+    assert result["ok"] is False
+    assert "out of scope" in result["error"].lower() or "does not match" in result["error"].lower()
+
+
+def test_safe_get_text_raises_scope_error_for_out_of_scope_url(monkeypatch):
+    patch_scope(monkeypatch)
+
+    try:
+        safe_get_text("https://evil.test/")
+    except ScopeError as exc:
+        assert "out of scope" in str(exc).lower() or "does not match" in str(exc).lower()
+    else:
+        raise AssertionError("safe_get_text should reject out-of-scope URLs")
+
+
+def test_safe_get_text_follows_redirects_within_scope(monkeypatch):
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if str(request.url) == "https://example.com/start":
+            return httpx.Response(302, headers={"location": "/final"})
+        return httpx.Response(200, text="done")
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = safe_get_text("https://example.com/start")
+
+    assert result == "done"
+    assert requested_urls == ["https://example.com/start", "https://example.com/final"]

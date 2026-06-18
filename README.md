@@ -48,7 +48,7 @@ Create a local `config/scope.json` from `config/scope.example.json`, then edit i
 }
 ```
 
-Set `scope_source` to `h1_snapshots` to load local H1-Scope-Watcher JSON files on every scope check. New snapshots are picked up without restarting the MCP server. Set `scope_source` to `manual` to use `allowed_domains` instead.
+Set `scope_source` to `h1_snapshots` to load local H1-Scope-Watcher JSON files for scope checks. Scope config is cached briefly, and new snapshots are picked up without restarting the MCP server. Set `scope_source` to `manual` to use `allowed_domains` instead.
 
 Exact domains and subdomains are allowed. For example, `api.example.com` matches `example.com`. H1 wildcard entries like `*.example.com` are normalized into host rules. Localhost, loopback, private IPs, link-local IPs, and blocked domains are rejected. If H1 snapshots are missing or invalid, scope checks fail closed.
 
@@ -57,6 +57,7 @@ Request hygiene settings:
 - `user_agent` sets the User-Agent used by read-only HTTP helpers. The default is `ReconMCP/0.1`.
 - `request_delay_ms` adds a small delay before network requests. The default is `500`.
 - `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
+- `check_scope_batch` accepts up to 200 hosts or URLs per call.
 - `fetch_headers_method` defaults to `HEAD`. If `HEAD` is blocked or fails before useful headers are available, `fetch_headers` falls back to a safe `GET` that requests only the first byte and still checks scope before every redirect hop.
 
 ## H1-Scope-Watcher Snapshots
@@ -163,7 +164,7 @@ recon-mcp/
 ├── README.md
 ├── server.py
 ├── config/
-│   └── scope.json
+│   └── scope.example.json
 ├── recon/
 │   ├── __init__.py
 │   ├── h1_scope.py

@@ -22,6 +22,8 @@ from recon.scope import (
 USER_AGENT = DEFAULT_USER_AGENT
 TIMEOUT_SECONDS = 10.0
 MAX_REDIRECTS = 5
+MAX_ROBOTS_BYTES = 512 * 1024
+MAX_SITEMAP_BYTES = 1024 * 1024
 SECURITY_HEADERS = [
     "Content-Security-Policy",
     "Strict-Transport-Security",
@@ -41,6 +43,15 @@ def _origin_url(url: str) -> str:
 def _headers_dict(response: httpx.Response) -> dict:
     """Convert response headers into a plain dictionary."""
     return {key: value for key, value in response.headers.items()}
+
+
+def _truncate_response_text(response: httpx.Response, max_bytes: int) -> tuple[str, bool]:
+    """Return response text capped by byte length."""
+    content = response.content
+    if len(content) <= max_bytes:
+        return response.text, False
+    encoding = response.encoding or "utf-8"
+    return content[:max_bytes].decode(encoding, errors="replace"), True
 
 
 def _client() -> httpx.Client:
@@ -124,6 +135,14 @@ def _safe_head(client: httpx.Client, url: str) -> httpx.Response:
     return _safe_request(client, "HEAD", url)
 
 
+def safe_get_text(url: str) -> str:
+    """GET text from an in-scope URL using the shared redirect-safety path."""
+    with _client() as client:
+        response = _safe_get(client, url)
+        response.raise_for_status()
+        return response.text
+
+
 def fetch_headers(url: str) -> dict:
     """Fetch response headers from an in-scope URL using HEAD with safe GET fallback."""
     method_used = get_fetch_headers_method()
@@ -192,9 +211,11 @@ def fetch_robots(url: str) -> dict:
     except httpx.HTTPError as exc:
         return _error_result(url, f"HTTP request failed: {exc}")
 
+    robots_text, content_truncated = _truncate_response_text(response, MAX_ROBOTS_BYTES)
+
     disallow = []
     allow = []
-    for line in response.text.splitlines():
+    for line in robots_text.splitlines():
         if match := re.match(r"^\s*Disallow\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
             disallow.append(match.group(1))
         elif match := re.match(r"^\s*Allow\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
@@ -205,7 +226,8 @@ def fetch_robots(url: str) -> dict:
         "url": robots_url,
         "final_url": str(response.url),
         "status_code": response.status_code,
-        "content_preview": response.text[:2000],
+        "content_preview": robots_text[:2000],
+        "content_truncated": content_truncated,
         "disallow": disallow,
         "allow": allow,
     }
@@ -223,11 +245,15 @@ def fetch_sitemap(url: str) -> dict:
     except httpx.HTTPError as exc:
         return _error_result(url, f"HTTP request failed: {exc}")
 
+    sitemap_text, content_truncated = _truncate_response_text(response, MAX_SITEMAP_BYTES)
+
     discovered_urls = []
     parse_error = None
-    if response.text.strip():
+    if content_truncated:
+        parse_error = "Response too large to parse."
+    elif sitemap_text.strip():
         try:
-            root = ET.fromstring(response.text)
+            root = ET.fromstring(sitemap_text)
             for element in root.iter():
                 if element.tag.endswith("loc") and element.text:
                     discovered_urls.append(element.text.strip())
@@ -241,6 +267,7 @@ def fetch_sitemap(url: str) -> dict:
         "status_code": response.status_code,
         "discovered_urls": sorted(set(discovered_urls)),
         "count": len(set(discovered_urls)),
-        "content_preview": response.text[:2000],
+        "content_preview": sitemap_text[:2000],
+        "content_truncated": content_truncated,
         "parse_error": parse_error,
     }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,7 +18,11 @@ DEFAULT_USER_AGENT = "ReconMCP/0.1"
 DEFAULT_REQUEST_DELAY_MS = 500
 DEFAULT_MAX_REQUESTS_PER_TOOL_CALL = 20
 DEFAULT_FETCH_HEADERS_METHOD = "HEAD"
+MAX_BATCH_SIZE = 200
+SCOPE_CACHE_TTL_SECONDS = 30.0
 SUPPORTED_HOST_ASSET_TYPES = {"", "url", "domain", "wildcard", "api"}
+_scope_cache: dict | None = None
+_scope_cache_time = 0.0
 
 
 class ScopeError(ValueError):
@@ -26,11 +31,17 @@ class ScopeError(ValueError):
 
 def load_scope() -> dict:
     """Load the configured scope file as a JSON-compatible dictionary."""
+    global _scope_cache, _scope_cache_time
+
+    now = time.monotonic()
+    if _scope_cache is not None and now - _scope_cache_time < SCOPE_CACHE_TTL_SECONDS:
+        return _scope_cache
+
     try:
         with DEFAULT_SCOPE_PATH.open("r", encoding="utf-8") as scope_file:
             data = json.load(scope_file)
     except FileNotFoundError:
-        return {
+        result = {
             "scope_source": "manual",
             "allowed_domains": [],
             "blocked_domains": [],
@@ -39,10 +50,13 @@ def load_scope() -> dict:
             "max_requests_per_tool_call": DEFAULT_MAX_REQUESTS_PER_TOOL_CALL,
             "fetch_headers_method": DEFAULT_FETCH_HEADERS_METHOD,
         }
+        _scope_cache = result
+        _scope_cache_time = now
+        return result
     except json.JSONDecodeError as exc:
         raise ScopeError(f"Invalid scope config: {exc}") from exc
 
-    return {
+    result = {
         "scope_source": data.get("scope_source", "manual"),
         "h1_snapshot_dir": data.get("h1_snapshot_dir", ""),
         "include_only_bounty_eligible": bool(data.get("include_only_bounty_eligible", False)),
@@ -54,6 +68,16 @@ def load_scope() -> dict:
         "max_requests_per_tool_call": int(data.get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL)),
         "fetch_headers_method": str(data.get("fetch_headers_method") or DEFAULT_FETCH_HEADERS_METHOD).upper(),
     }
+    _scope_cache = result
+    _scope_cache_time = now
+    return result
+
+
+def _invalidate_scope_cache() -> None:
+    """Clear cached scope config; intended for tests and config reload workflows."""
+    global _scope_cache, _scope_cache_time
+    _scope_cache = None
+    _scope_cache_time = 0.0
 
 
 def normalize_domain(value: str) -> str:
@@ -66,7 +90,7 @@ def normalize_domain(value: str) -> str:
     if lowered.startswith("host:"):
         raw = raw.split(":", 1)[1].strip()
     elif lowered.startswith(":authority:"):
-        raw = raw.split(":", 1)[1].strip()
+        raw = raw.split(":authority:", 1)[-1].strip()
 
     parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="https")
     host = parsed.hostname or raw
@@ -98,10 +122,10 @@ def is_private_or_loopback_host(host: str) -> bool:
     )
 
 
-def is_blocked_domain(domain: str) -> bool:
+def is_blocked_domain(domain: str, scope: dict | None = None) -> bool:
     """Return True when a domain is blocked by config or IP safety rules."""
     normalized = normalize_domain(domain)
-    scope = load_scope()
+    scope = scope or load_scope()
     blocked_domains = [normalize_domain(item) for item in scope.get("blocked_domains", [])]
 
     if is_private_or_loopback_host(normalized):
@@ -347,11 +371,6 @@ def _load_h1_allowed_scope(scope: dict) -> dict:
     return {"entries": entries, **extracted}
 
 
-def _check_h1_scope(domain: str, normalized: str, scope: dict) -> dict:
-    """Check a target against H1-Scope-Watcher snapshot scope."""
-    return resolve_scope_target(domain)
-
-
 def _resolve_manual_scope(input_value: str, normalized: str, scope: dict, response_format: str | None = None) -> dict:
     """Resolve a host against manually configured scope."""
     result = _check_manual_scope(input_value, normalized, scope)
@@ -523,7 +542,7 @@ def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
             result["mcp_interop"] = _interop_payload(result)
         return result
 
-    if is_blocked_domain(normalized):
+    if is_blocked_domain(normalized, scope):
         result = {
             "ok": True,
             "input": host_or_url,
@@ -591,7 +610,15 @@ def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
 
 
 def check_scope_batch(hosts_or_urls: list[str], format: str | None = None) -> dict:
-    """Return one structured scope decision for each host or URL."""
+    """Return one rich resolver-shaped scope decision for each host or URL."""
+    if len(hosts_or_urls) > MAX_BATCH_SIZE:
+        return {
+            "ok": False,
+            "count": len(hosts_or_urls),
+            "max_batch_size": MAX_BATCH_SIZE,
+            "error": f"Batch size {len(hosts_or_urls)} exceeds maximum {MAX_BATCH_SIZE}.",
+        }
+
     return {
         "ok": True,
         "count": len(hosts_or_urls),
@@ -744,47 +771,8 @@ def explain_scope_decision(host_or_url: str) -> dict:
 
 
 def check_scope(domain: str) -> dict:
-    """Check whether a domain or URL is inside the configured scope."""
-    normalized = normalize_domain(domain)
-    scope = load_scope()
-    scope_source = scope.get("scope_source", "manual")
-
-    if not normalized:
-        return {
-            "ok": False,
-            "input": domain,
-            "domain": normalized,
-            "target": normalized,
-            "in_scope": False,
-            "scope_source": scope_source,
-            "reason": "No domain or host was provided.",
-        }
-
-    if is_blocked_domain(normalized):
-        return {
-            "ok": True,
-            "input": domain,
-            "domain": normalized,
-            "target": normalized,
-            "in_scope": False,
-            "scope_source": scope_source,
-            "reason": "Target is blocked by safety rules or blocked_domains.",
-        }
-
-    if scope_source == "h1_snapshots":
-        return _check_h1_scope(domain, normalized, scope)
-    if scope_source == "manual":
-        return _check_manual_scope(domain, normalized, scope)
-
-    return {
-        "ok": False,
-        "input": domain,
-        "domain": normalized,
-        "target": normalized,
-        "in_scope": False,
-        "scope_source": scope_source,
-        "reason": f"Unsupported scope_source: {scope_source}",
-    }
+    """Check whether a domain or URL is inside scope using the rich resolver response shape."""
+    return resolve_scope_target(domain)
 
 
 def list_loaded_scope() -> dict:

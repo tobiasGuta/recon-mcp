@@ -1,6 +1,7 @@
 import json
 
 from recon.h1_scope import (
+    _is_private_or_loopback_host,
     extract_allowed_hosts_from_h1_entries,
     load_h1_snapshots,
     normalise_h1_asset_identifier,
@@ -89,6 +90,14 @@ def test_blocks_localhost_and_private_ip_entries():
     assert [item["host"] for item in result["allowed_hosts"]] == ["example.com"]
 
 
+def test_h1_scope_blocks_api_localhost():
+    assert _is_private_or_loopback_host("api.localhost") is True
+
+
+def test_h1_scope_does_not_block_non_localhost_domain():
+    assert _is_private_or_loopback_host("example.com") is False
+
+
 def test_out_of_scope_domain_returns_false(tmp_path, monkeypatch):
     write_snapshot(
         tmp_path,
@@ -130,6 +139,21 @@ def test_subdomain_of_allowed_domain_returns_true(tmp_path, monkeypatch):
     assert result["eligible_for_bounty"] is True
     assert result["eligible_for_submission"] is True
     assert result["max_severity"] == "critical"
+
+
+def test_check_scope_h1_returns_same_in_scope_as_resolve_scope_target(tmp_path, monkeypatch):
+    write_snapshot(
+        tmp_path,
+        "security",
+        [{"asset_type": "URL", "asset_identifier": "https://example.com", "eligible_for_submission": True}],
+    )
+    monkeypatch.setattr("recon.scope.load_scope", lambda: h1_scope_config(tmp_path))
+
+    check_result = check_scope("api.example.com")
+    resolve_result = resolve_scope_target("api.example.com")
+
+    assert check_result["in_scope"] == resolve_result["in_scope"]
+    assert check_result["reason_code"] == resolve_result["reason_code"]
 
 
 def test_wildcard_allows_subdomain_but_not_base_or_suffix_trick(tmp_path, monkeypatch):
@@ -310,6 +334,32 @@ def test_check_scope_batch_returns_structured_results(tmp_path, monkeypatch):
     assert result["count"] == 2
     assert result["results"][0]["in_scope"] is True
     assert result["results"][1]["reason_code"] == "no_matching_asset"
+
+
+def test_check_scope_batch_respects_max_batch_size(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_domains": ["example.com"], "blocked_domains": []},
+    )
+
+    result = check_scope_batch(["example.com"] * 201)
+
+    assert result["ok"] is False
+    assert result["max_batch_size"] == 200
+    assert "exceeds maximum" in result["error"]
+
+
+def test_check_scope_batch_at_max_returns_results(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_domains": ["example.com"], "blocked_domains": []},
+    )
+
+    result = check_scope_batch(["example.com"] * 200)
+
+    assert result["ok"] is True
+    assert result["count"] == 200
+    assert len(result["results"]) == 200
 
 
 def test_get_scope_map_returns_normalized_entries(tmp_path, monkeypatch):

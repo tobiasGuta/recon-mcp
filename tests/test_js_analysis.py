@@ -126,3 +126,25 @@ def test_collect_js_urls_blocks_above_max_requests_per_tool_call(monkeypatch):
     assert result["ok"] is False
     assert result["max_requests_per_tool_call"] == 2
     assert "too many javascript urls" in result["error"].lower()
+
+
+def test_collect_js_urls_allows_at_exactly_max_limit(monkeypatch):
+    config = {
+        "scope_source": "manual",
+        "allowed_domains": ["example.com"],
+        "blocked_domains": [],
+        "max_requests_per_tool_call": 2,
+        "request_delay_ms": 0,
+    }
+    html = """
+    <script src="/one.js"></script>
+    <script src="/two.js"></script>
+    """
+
+    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: html)
+    monkeypatch.setattr("recon.js_analysis.load_scope", lambda: config)
+
+    result = collect_js_urls("https://example.com/")
+
+    assert result["ok"] is True
+    assert result["count"] == 2

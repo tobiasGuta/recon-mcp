@@ -31,7 +31,7 @@ def _is_private_or_loopback_host(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(normalized)
     except ValueError:
-        return normalized in {"localhost"}
+        return normalized == "localhost" or normalized.endswith(".localhost")
 
     return bool(
         ip.is_private

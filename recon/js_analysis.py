@@ -9,8 +9,8 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from bs4 import BeautifulSoup
 
-from recon.http_fetch import MAX_REDIRECTS, TIMEOUT_SECONDS, get_request_delay_ms, get_user_agent
-from recon.scope import DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, assert_in_scope, check_scope, load_scope
+from recon.http_fetch import safe_get_text
+from recon.scope import DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, check_scope, load_scope
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -30,33 +30,7 @@ ENDPOINT_PATTERNS = {
 
 def _fetch_text(url: str) -> str:
     """Fetch text from an in-scope URL."""
-    current_url = url
-    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"User-Agent": get_user_agent()}) as client:
-        for _ in range(MAX_REDIRECTS + 1):
-            assert_in_scope(current_url)
-            delay_ms = get_request_delay_ms()
-            if delay_ms:
-                import time
-
-                time.sleep(delay_ms / 1000)
-            response = client.get(current_url)
-            if not response.is_redirect:
-                response.raise_for_status()
-                return response.text
-
-            location = response.headers.get("location")
-            if not location:
-                response.raise_for_status()
-                return response.text
-
-            next_url = urljoin(str(response.url), location)
-            try:
-                assert_in_scope(next_url)
-            except ScopeError as exc:
-                raise ScopeError(f"Redirect blocked because target is out of scope: {next_url} ({exc})") from exc
-            current_url = next_url
-
-    raise ScopeError(f"Too many redirects; stopped after {MAX_REDIRECTS} redirects.")
+    return safe_get_text(url)
 
 
 def get_max_requests_per_tool_call() -> int:

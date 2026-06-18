@@ -80,3 +80,11 @@ def test_url_input_normalization():
     assert normalize_domain("https://API.Example.com:443/path?q=1") == "api.example.com"
     result = check_scope("https://API.Example.com:443/path?q=1")
     assert result["in_scope"] is True
+
+
+def test_normalize_domain_authority_header_format():
+    assert normalize_domain(":authority:api.example.com") == "api.example.com"
+
+
+def test_normalize_domain_host_header_format():
+    assert normalize_domain("host:api.example.com") == "api.example.com"

@@ -14,6 +14,9 @@ def _as_list(value: object) -> list:
 
 def generate_manual_test_plan(target_summary: dict) -> dict:
     """Generate a safe, human-led recon and validation checklist."""
+    if not isinstance(target_summary, dict):
+        return {"ok": False, "error": "target_summary must be a dictionary."}
+
     endpoints = _as_list(target_summary.get("endpoints"))
     js_urls = _as_list(target_summary.get("js_urls"))
     interesting_headers = target_summary.get("interesting_headers") or {}

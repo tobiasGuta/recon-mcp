@@ -28,14 +28,29 @@ def _list_or_text(value: object) -> str:
 
 def create_evidence_note(finding: dict) -> dict:
     """Write a Markdown evidence note for a manually reviewed finding."""
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    if EVIDENCE_DIR.is_symlink():
+        return {"ok": False, "error": "EVIDENCE_DIR must not be a symlink."}
+
+    try:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not create evidence directory: {exc}"}
+
     title = str(finding.get("title") or finding.get("summary") or "Recon finding")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    filename = f"{timestamp}-{_slug(title)}.md"
-    path = (EVIDENCE_DIR / filename).resolve()
+    base_filename = f"{timestamp}-{_slug(title)}"
+    filename = f"{base_filename}.md"
     evidence_root = EVIDENCE_DIR.resolve()
-    if path.parent != evidence_root or path.name != filename:
-        return {"ok": False, "error": "Unsafe evidence note filename."}
+    for suffix in range(1000):
+        candidate_name = filename if suffix == 0 else f"{base_filename}-{suffix}.md"
+        path = (EVIDENCE_DIR / candidate_name).resolve()
+        if path.parent != evidence_root or path.name != candidate_name:
+            return {"ok": False, "error": "Unsafe evidence note filename."}
+        if not path.exists():
+            filename = candidate_name
+            break
+    else:
+        return {"ok": False, "error": "Could not find a unique evidence note filename."}
 
     impact = finding.get("impact") or "Manual impact analysis needed."
     content = f"""# {title}
