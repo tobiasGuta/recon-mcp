@@ -5,13 +5,28 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from recon import __version__
+from recon.campaigns import create_campaign as create_campaign_logic
+from recon.campaigns import get_campaign as get_campaign_logic
+from recon.campaigns import list_campaigns as list_campaigns_logic
+from recon.endpoint_scoring import score_endpoint as score_endpoint_logic
+from recon.endpoint_scoring import score_endpoints as score_endpoints_logic
+from recon.findings import create_finding_candidate as create_finding_candidate_logic
+from recon.findings import demote_finding as demote_finding_logic
+from recon.findings import get_finding as get_finding_logic
+from recon.findings import list_findings as list_findings_logic
+from recon.findings import promote_finding as promote_finding_logic
+from recon.findings import reject_finding as reject_finding_logic
 from recon.http_fetch import fetch_headers as fetch_headers_logic
 from recon.http_fetch import fetch_robots as fetch_robots_logic
 from recon.http_fetch import fetch_sitemap as fetch_sitemap_logic
 from recon.js_analysis import collect_js_urls as collect_js_urls_logic
 from recon.js_analysis import extract_endpoints_from_js as extract_endpoints_from_js_logic
+from recon.memory import list_negative_results as list_negative_results_logic
+from recon.memory import record_negative_result as record_negative_result_logic
+from recon.notes import create_campaign_evidence_note as create_campaign_evidence_note_logic
 from recon.notes import create_evidence_note as create_evidence_note_logic
 from recon.planner import generate_manual_test_plan as generate_manual_test_plan_logic
+from recon.reports import generate_report_candidate_markdown as generate_report_candidate_markdown_logic
 from recon.scope import check_scope as check_scope_logic
 from recon.scope import check_scope_batch as check_scope_batch_logic
 from recon.scope import explain_scope_decision as explain_scope_decision_logic
@@ -20,6 +35,14 @@ from recon.scope import list_loaded_scope as list_loaded_scope_logic
 from recon.scope import recommend_bugmap_parent as recommend_bugmap_parent_logic
 from recon.scope import resolve_scope_target as resolve_scope_target_logic
 from recon.urls import dedupe_urls as dedupe_urls_logic
+from recon.workflow import collect_js_urls_for_campaign as collect_js_urls_for_campaign_logic
+from recon.workflow import extract_endpoints_for_campaign as extract_endpoints_for_campaign_logic
+from recon.workflow import fetch_headers_for_campaign as fetch_headers_for_campaign_logic
+from recon.workflow import fetch_robots_for_campaign as fetch_robots_for_campaign_logic
+from recon.workflow import fetch_sitemap_for_campaign as fetch_sitemap_for_campaign_logic
+from recon.workflow import generate_campaign_summary as generate_campaign_summary_logic
+from recon.workflow import generate_manual_test_plan_for_campaign as generate_manual_test_plan_for_campaign_logic
+from recon.workflow import save_dirfuzz_analysis_for_campaign as save_dirfuzz_analysis_for_campaign_logic
 
 
 mcp = FastMCP("recon-mcp")
@@ -42,6 +65,29 @@ AVAILABLE_TOOLS = [
     "create_evidence_note",
     "generate_manual_test_plan",
     "dirfuzz_integration_info",
+    "create_campaign",
+    "list_campaigns",
+    "get_campaign",
+    "fetch_headers_for_campaign",
+    "fetch_robots_for_campaign",
+    "fetch_sitemap_for_campaign",
+    "collect_js_urls_for_campaign",
+    "extract_endpoints_for_campaign",
+    "save_dirfuzz_analysis_for_campaign",
+    "create_finding_candidate",
+    "get_finding",
+    "list_findings",
+    "promote_finding",
+    "demote_finding",
+    "reject_finding",
+    "create_campaign_evidence_note",
+    "score_endpoint",
+    "score_endpoints",
+    "record_negative_result",
+    "list_negative_results",
+    "generate_manual_test_plan_for_campaign",
+    "generate_campaign_summary",
+    "generate_report_candidate_markdown",
 ]
 
 
@@ -173,6 +219,151 @@ def dirfuzz_integration_info() -> dict:
             "Use Codex Desktop with both MCP servers enabled for a coordinated workflow.",
         ],
     }
+
+
+@mcp.tool()
+def create_campaign(program: str, target: str, notes: str | None = None) -> dict:
+    """Create an in-scope campaign for authorized, human-led testing only."""
+    return create_campaign_logic(program, target, notes=notes)
+
+
+@mcp.tool()
+def list_campaigns(limit: int = 50) -> dict:
+    """List local campaigns for authorized, human-led testing workflows only."""
+    return list_campaigns_logic(limit=limit)
+
+
+@mcp.tool()
+def get_campaign(campaign_id: str) -> dict:
+    """Get campaign metadata for authorized, human-led testing only."""
+    return get_campaign_logic(campaign_id)
+
+
+@mcp.tool()
+def fetch_headers_for_campaign(campaign_id: str, url: str) -> dict:
+    """Fetch headers for an in-scope campaign URL for authorized, human-led testing only."""
+    return fetch_headers_for_campaign_logic(campaign_id, url)
+
+
+@mcp.tool()
+def fetch_robots_for_campaign(campaign_id: str, url: str) -> dict:
+    """Fetch robots.txt for an in-scope campaign URL for authorized, human-led testing only."""
+    return fetch_robots_for_campaign_logic(campaign_id, url)
+
+
+@mcp.tool()
+def fetch_sitemap_for_campaign(campaign_id: str, url: str) -> dict:
+    """Fetch sitemap.xml for an in-scope campaign URL for authorized, human-led testing only."""
+    return fetch_sitemap_for_campaign_logic(campaign_id, url)
+
+
+@mcp.tool()
+def collect_js_urls_for_campaign(campaign_id: str, url: str) -> dict:
+    """Collect in-scope JS URLs for a campaign for authorized, human-led testing only."""
+    return collect_js_urls_for_campaign_logic(campaign_id, url)
+
+
+@mcp.tool()
+def extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_type: str | None = None) -> dict:
+    """Extract and score endpoint candidates for authorized, human-led testing only."""
+    return extract_endpoints_for_campaign_logic(campaign_id, file_or_url, source_type=source_type)
+
+
+@mcp.tool()
+def save_dirfuzz_analysis_for_campaign(campaign_id: str, analysis: dict) -> dict:
+    """Save Go DirFuzz analysis for an authorized, human-led campaign only."""
+    return save_dirfuzz_analysis_for_campaign_logic(campaign_id, analysis)
+
+
+@mcp.tool()
+def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
+    """Create a candidate in the hallucination bin for authorized, human-led testing only."""
+    return create_finding_candidate_logic(campaign_id, finding)
+
+
+@mcp.tool()
+def get_finding(campaign_id: str, finding_id: str) -> dict:
+    """Get a finding candidate for authorized, human-led testing only."""
+    return get_finding_logic(campaign_id, finding_id)
+
+
+@mcp.tool()
+def list_findings(campaign_id: str, status: str | None = None) -> dict:
+    """List finding candidates for authorized, human-led testing only."""
+    return list_findings_logic(campaign_id, status=status)
+
+
+@mcp.tool()
+def promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None) -> dict:
+    """Promote a finding after human validation for authorized, human-led testing only."""
+    return promote_finding_logic(campaign_id, finding_id, target_status, reason, gate_updates=gate_updates)
+
+
+@mcp.tool()
+def demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str) -> dict:
+    """Demote a finding for safer authorized, human-led review only."""
+    return demote_finding_logic(campaign_id, finding_id, target_status, reason)
+
+
+@mcp.tool()
+def reject_finding(campaign_id: str, finding_id: str, reason: str) -> dict:
+    """Reject a candidate finding during authorized, human-led testing only."""
+    return reject_finding_logic(campaign_id, finding_id, reason)
+
+
+@mcp.tool()
+def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
+    """Create campaign evidence notes for authorized, human-led testing only."""
+    return create_campaign_evidence_note_logic(campaign_id, finding)
+
+
+@mcp.tool()
+def score_endpoint(endpoint: dict | str) -> dict:
+    """Score an endpoint for manual review in authorized, human-led testing only."""
+    return score_endpoint_logic(endpoint)
+
+
+@mcp.tool()
+def score_endpoints(endpoints: list[dict | str]) -> dict:
+    """Score endpoints for manual review in authorized, human-led testing only."""
+    return score_endpoints_logic(endpoints)
+
+
+@mcp.tool()
+def record_negative_result(
+    campaign_id: str,
+    target: str,
+    check_type: str,
+    result: str,
+    repeat_after: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Record non-finding campaign memory for authorized, human-led testing only."""
+    return record_negative_result_logic(campaign_id, target, check_type, result, repeat_after=repeat_after, metadata=metadata)
+
+
+@mcp.tool()
+def list_negative_results(campaign_id: str, check_type: str | None = None) -> dict:
+    """List non-finding campaign memory for authorized, human-led testing only."""
+    return list_negative_results_logic(campaign_id, check_type=check_type)
+
+
+@mcp.tool()
+def generate_manual_test_plan_for_campaign(campaign_id: str) -> dict:
+    """Generate a safe manual test plan for authorized, human-led testing only."""
+    return generate_manual_test_plan_for_campaign_logic(campaign_id)
+
+
+@mcp.tool()
+def generate_campaign_summary(campaign_id: str) -> dict:
+    """Generate a campaign summary for authorized, human-led testing only."""
+    return generate_campaign_summary_logic(campaign_id)
+
+
+@mcp.tool()
+def generate_report_candidate_markdown(campaign_id: str, finding_id: str) -> dict:
+    """Generate local report Markdown for authorized, human-led testing only; no submission occurs."""
+    return generate_report_candidate_markdown_logic(campaign_id, finding_id)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from recon.audit import write_audit_event
+from recon.campaigns import get_campaign_paths
+from recon.findings import update_finding_gates
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EVIDENCE_DIR = PROJECT_ROOT / "output" / "evidence"
@@ -83,3 +87,87 @@ def create_evidence_note(finding: dict) -> dict:
         return {"ok": False, "error": f"Could not write evidence note: {exc}"}
 
     return {"ok": True, "path": str(path), "title": title}
+
+
+def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
+    """Write a campaign evidence note for authorized manual validation only."""
+    if not isinstance(finding, dict):
+        return {"ok": False, "error": "finding must be a dictionary."}
+    paths = get_campaign_paths(campaign_id)
+    if not paths.get("ok"):
+        return {"ok": False, "error": paths.get("error", "Could not load campaign paths.")}
+
+    evidence_dir = Path(paths["paths"]["evidence"])
+    if evidence_dir.is_symlink():
+        return {"ok": False, "error": "Campaign evidence directory must not be a symlink."}
+    title = str(finding.get("title") or finding.get("summary") or "Recon finding")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"{timestamp}-{_slug(title)}.md"
+    evidence_root = evidence_dir.resolve()
+    path = (evidence_dir / filename).resolve()
+    if path.parent != evidence_root or path.name != filename:
+        return {"ok": False, "error": "Unsafe evidence note filename."}
+
+    scope_confirmation = finding.get("scope_confirmation") or finding.get("promotion_gates", {}).get("scope_confirmed")
+    request_response = finding.get("request_response") or finding.get("request_response_metadata")
+    content = f"""# {title}
+
+## Target
+{_list_or_text(finding.get("target"))}
+
+## Summary
+{_list_or_text(finding.get("summary"))}
+
+## Scope Confirmation
+{_list_or_text(scope_confirmation)}
+
+## Request / Response Metadata
+{_list_or_text(request_response)}
+
+## Evidence
+{_list_or_text(finding.get("evidence"))}
+
+## Steps to Reproduce
+{_list_or_text(finding.get("steps_to_reproduce"))}
+
+## Impact
+{_list_or_text(finding.get("impact") or finding.get("impact_hypothesis"))}
+
+## Manual Validation Checklist
+{_list_or_text(finding.get("manual_validation_checklist") or finding.get("manual_validation_needed"))}
+
+## Status / Gates
+{_list_or_text({"status": finding.get("status"), **(finding.get("promotion_gates") or {})})}
+
+## Notes
+{_list_or_text(finding.get("notes"))}
+"""
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not write campaign evidence note: {exc}"}
+
+    gate_result = None
+    finding_id = finding.get("finding_id")
+    if finding_id:
+        gate_result = update_finding_gates(
+            campaign_id,
+            str(finding_id),
+            {"evidence_saved": True},
+            "Campaign evidence note was created.",
+        )
+
+    audit = write_audit_event(
+        campaign_id,
+        "create_campaign_evidence_note",
+        target=str(finding.get("target") or ""),
+        ok=True,
+        result_path=str(path),
+        metadata={"finding_id": finding_id},
+    )
+    warnings = []
+    if gate_result and not gate_result.get("ok"):
+        warnings.append(f"Finding gate was not updated: {gate_result.get('error')}")
+    if not audit.get("ok"):
+        warnings.extend(audit.get("warnings", []))
+    return {"ok": True, "path": str(path), "title": title, "gate_update": gate_result, "warnings": warnings}

@@ -1,6 +1,6 @@
 # recon-mcp
 
-`recon-mcp` is a local Python MCP server for authorized, low-risk, human-led bug bounty recon. It provides lightweight helpers for scope checks, headers, robots.txt, sitemap.xml, JavaScript URL collection, endpoint extraction, URL deduplication, evidence notes, and manual test planning.
+`recon-mcp` is a local Python MCP server for authorized, low-risk, human-led bug bounty recon. It provides lightweight helpers for scope checks, headers, robots.txt, sitemap.xml, JavaScript URL collection, endpoint extraction, URL deduplication, evidence notes, manual test planning, and campaign-based recon organization.
 
 This project complements a separate Go DirFuzz MCP server. It does not implement directory fuzzing in Python. For scope, it can use local JSON snapshots written by H1-Scope-Watcher as the source of truth.
 
@@ -11,6 +11,60 @@ This server is designed for authorized, low-risk security testing only. Every ne
 It does not exploit vulnerabilities, bypass authentication, brute-force accounts, create accounts, perform login testing, send destructive requests, run high-volume scans, or scan outside configured scope.
 
 Directory fuzzing belongs in the separate Go DirFuzz MCP server, with tools such as `dirfuzz_scan`, `dirfuzz_scan_status`, `dirfuzz_cancel`, `dirfuzz_analyze`, `dirfuzz_list_scope`, and `dirfuzz_build_scan`.
+
+## Campaign Workflow
+
+Campaigns organize scoped recon artifacts, finding candidates, evidence, memory, and reports under `output/campaigns/<campaign_id>/`. Creating a campaign checks configured scope first and fails closed when the target is not authorized.
+
+Each campaign stores:
+
+```text
+output/campaigns/<campaign_id>/
+  campaign.json
+  scope.json
+  audit.jsonl
+  recon/
+  findings/
+  evidence/
+  memory/
+  reports/
+```
+
+Campaign-aware tools save JSON artifacts into the matching `recon/` subfolder and append audit events to `audit.jsonl`. Network-facing campaign tools still rely on the existing scope-enforced fetch and JavaScript helpers.
+
+Recommended campaign flow:
+
+1. `create_campaign`
+2. `fetch_headers_for_campaign`
+3. `fetch_robots_for_campaign`
+4. `fetch_sitemap_for_campaign`
+5. `collect_js_urls_for_campaign`
+6. `extract_endpoints_for_campaign`
+7. `score_endpoints`
+8. `create_finding_candidate`
+9. `promote_finding` only after manual validation
+10. `create_campaign_evidence_note`
+11. `generate_campaign_summary`
+12. `generate_report_candidate_markdown`
+
+`generate_campaign_summary` writes `reports/summary.md`, and `generate_manual_test_plan_for_campaign` writes `reports/manual_test_plan.md`. Reports are local Markdown files only; nothing is auto-submitted anywhere.
+
+## Finding Pipeline
+
+Possible issues are not vulnerabilities. Every new candidate starts in the hallucination bin at `findings/hallucinations/` with `manual_validation_required: true`.
+
+Allowed status flow:
+
+- `hallucination` to `needs_manual_validation`
+- `needs_manual_validation` to `validated`
+- `validated` to `report_candidate`
+- any status to `rejected`
+
+Report candidates require all gates to be true: scope confirmed, evidence saved, reproduced manually, impact proven, safe non-destructive testing, and report ready. The pipeline blocks direct jumps from hallucination to validated or report candidate.
+
+Negative-result memory is stored in `memory/negative_results.jsonl`. These records document useful checks that did not produce findings; they are included in summaries and manual plans, but they are not treated as vulnerabilities.
+
+The hallucination bin is intentional. It keeps AI-assisted or speculative leads separate until a human validates scope, evidence, reproducibility, impact, and safety.
 
 ## Installation
 
@@ -141,8 +195,31 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `create_evidence_note(finding: dict)`
 - `generate_manual_test_plan(target_summary: dict)`
 - `dirfuzz_integration_info()`
+- `create_campaign(program: str, target: str, notes: str | None = None)`
+- `list_campaigns(limit: int = 50)`
+- `get_campaign(campaign_id: str)`
+- `fetch_headers_for_campaign(campaign_id: str, url: str)`
+- `fetch_robots_for_campaign(campaign_id: str, url: str)`
+- `fetch_sitemap_for_campaign(campaign_id: str, url: str)`
+- `collect_js_urls_for_campaign(campaign_id: str, url: str)`
+- `extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_type: str | None = None)`
+- `save_dirfuzz_analysis_for_campaign(campaign_id: str, analysis: dict)`
+- `create_finding_candidate(campaign_id: str, finding: dict)`
+- `get_finding(campaign_id: str, finding_id: str)`
+- `list_findings(campaign_id: str, status: str | None = None)`
+- `promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None)`
+- `demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str)`
+- `reject_finding(campaign_id: str, finding_id: str, reason: str)`
+- `create_campaign_evidence_note(campaign_id: str, finding: dict)`
+- `score_endpoint(endpoint: dict | str)`
+- `score_endpoints(endpoints: list[dict | str])`
+- `record_negative_result(campaign_id: str, target: str, check_type: str, result: str, repeat_after: str | None = None, metadata: dict | None = None)`
+- `list_negative_results(campaign_id: str, check_type: str | None = None)`
+- `generate_manual_test_plan_for_campaign(campaign_id: str)`
+- `generate_campaign_summary(campaign_id: str)`
+- `generate_report_candidate_markdown(campaign_id: str, finding_id: str)`
 
-## Example Workflow
+## Legacy Example Workflow
 
 1. Run H1-Scope-Watcher in Docker with snapshots written to a host-accessible folder.
 2. Point Python Recon MCP `h1_snapshot_dir` at that snapshots folder.
@@ -155,6 +232,8 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 9. Analyze DirFuzz results with `dirfuzz_analyze`.
 10. Generate a manual test plan.
 11. Create evidence notes for manually validated findings.
+
+For campaign mode, prefer the campaign workflow above. Candidate findings are not vulnerabilities, everything starts in hallucinations until validated manually, reports are not auto-submitted, and DirFuzz remains separate in the Go DirFuzz MCP server.
 
 ## Project Layout
 
@@ -173,10 +252,18 @@ recon-mcp/
 │   ├── js_analysis.py
 │   ├── urls.py
 │   ├── notes.py
-│   └── planner.py
+│   ├── planner.py
+│   ├── campaigns.py
+│   ├── audit.py
+│   ├── workflow.py
+│   ├── findings.py
+│   ├── endpoint_scoring.py
+│   ├── memory.py
+│   └── reports.py
 ├── output/
 │   ├── logs/
 │   ├── evidence/
+│   ├── campaigns/
 │   └── reports/
 └── tests/
     ├── test_scope.py

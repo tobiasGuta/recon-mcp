@@ -1,0 +1,249 @@
+"""Campaign storage for authorized, human-led recon workflows."""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from recon.scope import normalize_domain, resolve_scope_target
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "campaigns"
+SAFETY_MODEL = "authorized_low_risk_human_led"
+CAMPAIGN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,159}$")
+RECON_SUBDIRS = ["headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz"]
+FINDING_SUBDIRS = [
+    "hallucinations",
+    "needs_manual_validation",
+    "validated",
+    "rejected",
+    "report_candidates",
+]
+
+
+def utc_now() -> datetime:
+    """Return a timezone-aware UTC timestamp."""
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    """Return the current UTC time in ISO format."""
+    return utc_now().isoformat()
+
+
+def file_timestamp() -> str:
+    """Return a compact UTC timestamp for filenames."""
+    return utc_now().strftime("%Y%m%dT%H%M%SZ")
+
+
+def slugify(value: str, *, fallback: str = "item", max_length: int = 80) -> str:
+    """Create a filesystem-safe lowercase slug."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
+    return (slug[:max_length].strip("-_") or fallback)[:max_length]
+
+
+def is_safe_campaign_id(campaign_id: str) -> bool:
+    """Return True when the campaign ID cannot escape the campaigns directory."""
+    return bool(CAMPAIGN_ID_PATTERN.fullmatch(str(campaign_id or "")))
+
+
+def _safe_error(message: str) -> dict:
+    return {"ok": False, "error": message}
+
+
+def _campaign_root(campaign_id: str) -> Path:
+    return CAMPAIGNS_DIR / campaign_id
+
+
+def _resolve_campaign_root(campaign_id: str, *, must_exist: bool = True) -> tuple[Path | None, str | None]:
+    if not is_safe_campaign_id(campaign_id):
+        return None, "Unsafe campaign_id."
+    base = CAMPAIGNS_DIR.resolve()
+    root = _campaign_root(campaign_id)
+    if must_exist and not root.exists():
+        return None, "Campaign does not exist."
+    try:
+        resolved = root.resolve()
+    except OSError as exc:
+        return None, f"Could not resolve campaign path: {exc}"
+    if resolved != base / campaign_id or not resolved.is_relative_to(base):
+        return None, "Campaign path escapes campaign storage."
+    return resolved, None
+
+
+def _reject_symlink(path: Path, label: str) -> str | None:
+    if path.exists() and path.is_symlink():
+        return f"{label} must not be a symlink."
+    return None
+
+
+def _guard_core_dirs(root: Path) -> str | None:
+    checks = {
+        "Campaign root": root,
+        "Evidence directory": root / "evidence",
+        "Findings directory": root / "findings",
+        "Reports directory": root / "reports",
+        "Memory directory": root / "memory",
+    }
+    for label, path in checks.items():
+        error = _reject_symlink(path, label)
+        if error:
+            return error
+    return None
+
+
+def _campaign_paths(root: Path) -> dict:
+    return {
+        "root": str(root),
+        "campaign_json": str(root / "campaign.json"),
+        "scope_json": str(root / "scope.json"),
+        "audit_jsonl": str(root / "audit.jsonl"),
+        "recon": {name: str(root / "recon" / name) for name in RECON_SUBDIRS},
+        "findings": {name: str(root / "findings" / name) for name in FINDING_SUBDIRS},
+        "evidence": str(root / "evidence"),
+        "memory": str(root / "memory"),
+        "negative_results_jsonl": str(root / "memory" / "negative_results.jsonl"),
+        "reports": str(root / "reports"),
+        "summary_md": str(root / "reports" / "summary.md"),
+        "manual_test_plan_md": str(root / "reports" / "manual_test_plan.md"),
+    }
+
+
+def _create_layout(root: Path) -> str | None:
+    error = _guard_core_dirs(root)
+    if error:
+        return error
+    try:
+        root.mkdir(parents=True, exist_ok=False)
+        (root / "recon").mkdir()
+        for name in RECON_SUBDIRS:
+            (root / "recon" / name).mkdir()
+        (root / "findings").mkdir()
+        for name in FINDING_SUBDIRS:
+            (root / "findings" / name).mkdir()
+        (root / "evidence").mkdir()
+        (root / "memory").mkdir()
+        (root / "reports").mkdir()
+    except OSError as exc:
+        return f"Could not create campaign layout: {exc}"
+    return _guard_core_dirs(root)
+
+
+def _unique_campaign_id(program: str, normalized_host: str) -> str:
+    base = f"{slugify(program, fallback='program')}-{slugify(normalized_host, fallback='target')}-{file_timestamp().lower()}"
+    base = base[:150].strip("-_") or "campaign"
+    for suffix in range(1000):
+        campaign_id = base if suffix == 0 else f"{base}-{suffix}"
+        if not _campaign_root(campaign_id).exists():
+            return campaign_id
+    return f"{base}-{utc_now().strftime('%f')}"
+
+
+def _write_json(path: Path, payload: dict) -> str | None:
+    try:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return f"Could not write {path.name}: {exc}"
+    return None
+
+
+def create_campaign(program: str, target: str, notes: str | None = None) -> dict:
+    """Create a scoped campaign for authorized, human-led recon only."""
+    scope_decision = resolve_scope_target(target)
+    if not scope_decision.get("ok", True) or not scope_decision.get("in_scope"):
+        return {
+            "ok": False,
+            "error": "Target is not in configured scope; campaign was not created.",
+            "scope_decision": scope_decision,
+        }
+
+    normalized_host = scope_decision.get("normalized_host") or normalize_domain(target)
+    campaign_id = _unique_campaign_id(program, normalized_host)
+    if not is_safe_campaign_id(campaign_id):
+        return _safe_error("Generated unsafe campaign_id.")
+
+    root, error = _resolve_campaign_root(campaign_id, must_exist=False)
+    if error:
+        return _safe_error(error)
+    assert root is not None
+
+    error = _create_layout(root)
+    if error:
+        return _safe_error(error)
+
+    now = iso_now()
+    metadata = {
+        "campaign_id": campaign_id,
+        "program": str(program or ""),
+        "target": str(target or ""),
+        "normalized_host": normalized_host,
+        "created_at": now,
+        "updated_at": now,
+        "scope_decision": scope_decision,
+        "safety_model": SAFETY_MODEL,
+        "notes": [notes] if notes else [],
+    }
+    for path, payload in ((root / "campaign.json", metadata), (root / "scope.json", scope_decision)):
+        error = _write_json(path, payload)
+        if error:
+            return _safe_error(error)
+
+    return {"ok": True, "campaign_id": campaign_id, "path": str(root), "scope_decision": scope_decision}
+
+
+def list_campaigns(limit: int = 50) -> dict:
+    """List stored campaigns without following unsafe campaign IDs."""
+    try:
+        CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _safe_error(f"Could not create campaign storage: {exc}")
+
+    campaigns = []
+    for path in CAMPAIGNS_DIR.iterdir():
+        if not path.is_dir() or not is_safe_campaign_id(path.name) or path.is_symlink():
+            continue
+        metadata_path = path / "campaign.json"
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        campaigns.append(metadata)
+
+    campaigns.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+    safe_limit = max(1, min(int(limit or 50), 500))
+    return {"ok": True, "campaigns": campaigns[:safe_limit], "count": min(len(campaigns), safe_limit)}
+
+
+def get_campaign(campaign_id: str) -> dict:
+    """Load campaign metadata for authorized, human-led recon only."""
+    root, error = _resolve_campaign_root(campaign_id)
+    if error:
+        return _safe_error(error)
+    assert root is not None
+    error = _guard_core_dirs(root)
+    if error:
+        return _safe_error(error)
+    try:
+        metadata = json.loads((root / "campaign.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _safe_error("Campaign metadata not found.")
+    except (OSError, json.JSONDecodeError) as exc:
+        return _safe_error(f"Could not load campaign metadata: {exc}")
+    return {"ok": True, "campaign": metadata, "path": str(root)}
+
+
+def get_campaign_paths(campaign_id: str) -> dict:
+    """Return safe campaign paths for authorized, human-led recon storage."""
+    root, error = _resolve_campaign_root(campaign_id)
+    if error:
+        return _safe_error(error)
+    assert root is not None
+    error = _guard_core_dirs(root)
+    if error:
+        return _safe_error(error)
+    return {"ok": True, "campaign_id": campaign_id, "paths": _campaign_paths(root)}
