@@ -1,4 +1,6 @@
 import httpx
+import pytest
+from defusedxml.common import DefusedXmlException
 
 from recon.http_fetch import (
     MAX_ROBOTS_BYTES,
@@ -30,6 +32,7 @@ def patch_scope(monkeypatch, **overrides):
     config = scoped_config(**overrides)
     monkeypatch.setattr("recon.scope.load_scope", lambda: config)
     monkeypatch.setattr("recon.http_fetch.load_scope", lambda: config)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["93.184.216.34"])
     return config
 
 
@@ -269,3 +272,177 @@ def test_safe_get_text_follows_redirects_within_scope(monkeypatch):
 
     assert result == "done"
     assert requested_urls == ["https://example.com/start", "https://example.com/final"]
+
+
+def test_safe_request_blocks_hostname_resolving_to_loopback(monkeypatch):
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["127.0.0.1"])
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "unsafe" in result["error"].lower()
+    assert "127.0.0.1" in result["error"]
+
+
+def test_safe_request_blocks_hostname_resolving_to_private_ip(monkeypatch):
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["10.0.0.1"])
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "unsafe" in result["error"].lower()
+    assert "10.0.0.1" in result["error"]
+
+
+def test_safe_request_blocks_hostname_resolving_to_link_local_ip(monkeypatch):
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["169.254.1.10"])
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "unsafe" in result["error"].lower()
+    assert "169.254.1.10" in result["error"]
+
+
+def test_safe_request_blocks_hostname_resolving_to_ipv6_loopback(monkeypatch):
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["::1"])
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "unsafe" in result["error"].lower()
+    assert "::1" in result["error"]
+
+
+def test_safe_request_fails_closed_on_dns_resolution_error(monkeypatch):
+    patch_scope(monkeypatch)
+
+    def fail_dns(host):
+        raise OSError("mock dns failure")
+
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", fail_dns)
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "dns resolution failed" in result["error"].lower()
+    assert "failing closed" in result["error"].lower()
+
+
+def test_safe_request_checks_redirect_resolved_ip_before_following(monkeypatch):
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if str(request.url) == "https://example.com/":
+            return httpx.Response(302, headers={"location": "https://sub.example.com/final"})
+        return httpx.Response(200, text="should not be requested")
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    def resolve(host):
+        if host == "sub.example.com":
+            return ["10.0.0.5"]
+        return ["93.184.216.34"]
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", resolve)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is False
+    assert "redirect blocked" in result["error"].lower()
+    assert "10.0.0.5" in result["error"]
+    assert requested_urls == ["https://example.com/"]
+
+
+def test_safe_request_allows_public_resolved_ip(monkeypatch):
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(200, headers={"x-test": "ok"})
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = fetch_headers("https://example.com/")
+
+    assert result["ok"] is True
+    assert requested_urls == ["https://example.com/"]
+
+
+def test_fetch_sitemap_blocks_xml_entity_expansion(monkeypatch):
+    body = """<?xml version="1.0"?>
+<!DOCTYPE lolz [
+ <!ENTITY lol "lol">
+ <!ENTITY lol1 "&lol;&lol;&lol;&lol;">
+]>
+<urlset><url><loc>&lol1;</loc></url></urlset>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+
+    result = fetch_sitemap("https://example.com/")
+
+    assert result["ok"] is True
+    assert result["discovered_urls"] == []
+    assert result["parse_error"]
+    assert "parsed" in result["parse_error"].lower()
+
+
+def test_fetch_sitemap_handles_defusedxml_exception_safely(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<urlset />")
+
+    def client():
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "ReconMCP/0.1"},
+        )
+
+    def blocked_xml(text):
+        raise DefusedXmlException("blocked by test")
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", client)
+    monkeypatch.setattr("recon.http_fetch.ET.fromstring", blocked_xml)
+
+    result = fetch_sitemap("https://example.com/")
+
+    assert result["ok"] is True
+    assert result["discovered_urls"] == []
+    assert "blocked by test" in result["parse_error"]

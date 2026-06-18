@@ -8,7 +8,11 @@ This project complements a separate Go DirFuzz MCP server. It does not implement
 
 This server is designed for authorized, low-risk security testing only. Every network-facing Python tool checks configured scope before making requests and before following redirect targets. HTTP behavior is read-only, uses timeouts and small request delays, and avoids custom attack payloads.
 
-It does not exploit vulnerabilities, bypass authentication, brute-force accounts, create accounts, perform login testing, send destructive requests, run high-volume scans, or scan outside configured scope.
+Recon MCP blocks literal local, loopback, private, link-local, multicast, reserved, and unspecified IP targets. It also resolves hostnames before requests and before following redirects, then blocks any hostname that resolves to those unsafe IP ranges. This helps reduce DNS rebinding and accidental internal-network request risks while preserving a fail-closed recon model.
+
+Sitemap XML parsing uses `defusedxml` so unsafe XML constructs are rejected safely instead of being parsed by the standard library XML parser.
+
+It does not exploit vulnerabilities, bypass authentication, brute-force accounts, create accounts, perform login testing, send destructive requests, run high-volume scans, or scan outside configured scope. DNS resolved-IP checks and hardened XML parsing are defensive controls for authorized recon, not bypass or exploitation features.
 
 Directory fuzzing belongs in the separate Go DirFuzz MCP server, with tools such as `dirfuzz_scan`, `dirfuzz_scan_status`, `dirfuzz_cancel`, `dirfuzz_analyze`, `dirfuzz_list_scope`, and `dirfuzz_build_scan`.
 

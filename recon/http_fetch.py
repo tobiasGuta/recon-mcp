@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+import socket
 import time
-import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 from recon.scope import (
     DEFAULT_FETCH_HEADERS_METHOD,
@@ -15,7 +17,9 @@ from recon.scope import (
     DEFAULT_USER_AGENT,
     ScopeError,
     assert_in_scope,
+    is_private_or_loopback_host,
     load_scope,
+    normalize_domain,
 )
 
 
@@ -91,11 +95,48 @@ def _request_delay() -> None:
         time.sleep(delay_ms / 1000)
 
 
+def resolve_host_ips(host: str) -> list[str]:
+    """Resolve a hostname to IP strings for DNS safety checks."""
+    resolved = []
+    seen = set()
+    for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+        ip = item[4][0]
+        if ip not in seen:
+            resolved.append(ip)
+            seen.add(ip)
+    return resolved
+
+
+def assert_resolved_host_is_public(url: str) -> None:
+    """Resolve a URL hostname and raise ScopeError if any resolved IP is unsafe."""
+    host = urlsplit(url).hostname
+    if not host:
+        raise ScopeError("URL has no hostname for DNS safety check.")
+
+    normalized = normalize_domain(host)
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        raise ScopeError(f"Hostname is blocked by DNS safety rules: {host}")
+    if is_private_or_loopback_host(normalized):
+        raise ScopeError(f"Hostname is an unsafe local/private IP: {host}")
+
+    try:
+        resolved_ips = resolve_host_ips(normalized)
+    except OSError as exc:
+        raise ScopeError(f"DNS resolution failed for {host}; failing closed: {exc}") from exc
+    if not resolved_ips:
+        raise ScopeError(f"DNS resolution returned no addresses for {host}; failing closed.")
+
+    unsafe_ips = [ip for ip in resolved_ips if is_private_or_loopback_host(ip)]
+    if unsafe_ips:
+        raise ScopeError(f"Hostname {host} resolved to unsafe local/private IP(s): {', '.join(unsafe_ips)}")
+
+
 def _safe_request(client: httpx.Client, method: str, url: str, *, headers_only: bool = False) -> httpx.Response:
     """Request a URL and validate every redirect target before following it."""
     current_url = url
     for _ in range(MAX_REDIRECTS + 1):
         assert_in_scope(current_url)
+        assert_resolved_host_is_public(current_url)
         _request_delay()
         if headers_only and method.upper() == "GET":
             request = client.build_request("GET", current_url, headers={"Range": "bytes=0-0"})
@@ -113,8 +154,9 @@ def _safe_request(client: httpx.Client, method: str, url: str, *, headers_only: 
         next_url = urljoin(str(response.url), location)
         try:
             assert_in_scope(next_url)
+            assert_resolved_host_is_public(next_url)
         except ScopeError as exc:
-            raise ScopeError(f"Redirect blocked because target is out of scope: {next_url} ({exc})") from exc
+            raise ScopeError(f"Redirect blocked because target is unsafe or out of scope: {next_url} ({exc})") from exc
         current_url = next_url
 
     raise ScopeError(f"Too many redirects; stopped after {MAX_REDIRECTS} redirects.")
@@ -257,7 +299,7 @@ def fetch_sitemap(url: str) -> dict:
             for element in root.iter():
                 if element.tag.endswith("loc") and element.text:
                     discovered_urls.append(element.text.strip())
-        except ET.ParseError as exc:
+        except (ET.ParseError, DefusedXmlException) as exc:
             parse_error = f"Sitemap XML could not be parsed: {exc}"
 
     return {

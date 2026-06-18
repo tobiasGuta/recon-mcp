@@ -17,4 +17,5 @@ def campaign_env(monkeypatch, tmp_path):
     monkeypatch.setattr("recon.scope.load_scope", lambda: config)
     monkeypatch.setattr("recon.http_fetch.load_scope", lambda: config)
     monkeypatch.setattr("recon.js_analysis.load_scope", lambda: config)
+    monkeypatch.setattr("recon.http_fetch.resolve_host_ips", lambda host: ["93.184.216.34"])
     return root
