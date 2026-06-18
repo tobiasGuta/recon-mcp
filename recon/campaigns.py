@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from recon.scope import normalize_domain, resolve_scope_target
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "campaigns"
+ARCHIVED_CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "archived_campaigns"
 SAFETY_MODEL = "authorized_low_risk_human_led"
 CAMPAIGN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,159}$")
 RECON_SUBDIRS = ["headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz", "sourcemaps"]
@@ -58,6 +60,10 @@ def _campaign_root(campaign_id: str) -> Path:
     return CAMPAIGNS_DIR / campaign_id
 
 
+def _archived_campaign_root(campaign_id: str) -> Path:
+    return ARCHIVED_CAMPAIGNS_DIR / campaign_id
+
+
 def _resolve_campaign_root(campaign_id: str, *, must_exist: bool = True) -> tuple[Path | None, str | None]:
     if not is_safe_campaign_id(campaign_id):
         return None, "Unsafe campaign_id."
@@ -71,6 +77,22 @@ def _resolve_campaign_root(campaign_id: str, *, must_exist: bool = True) -> tupl
         return None, f"Could not resolve campaign path: {exc}"
     if resolved != base / campaign_id or not resolved.is_relative_to(base):
         return None, "Campaign path escapes campaign storage."
+    return resolved, None
+
+
+def _resolve_archived_campaign_root(campaign_id: str, *, must_exist: bool = True) -> tuple[Path | None, str | None]:
+    if not is_safe_campaign_id(campaign_id):
+        return None, "Unsafe campaign_id."
+    base = ARCHIVED_CAMPAIGNS_DIR.resolve()
+    root = _archived_campaign_root(campaign_id)
+    if must_exist and not root.exists():
+        return None, "Archived campaign does not exist."
+    try:
+        resolved = root.resolve()
+    except OSError as exc:
+        return None, f"Could not resolve archived campaign path: {exc}"
+    if resolved != base / campaign_id or not resolved.is_relative_to(base):
+        return None, "Archived campaign path escapes archive storage."
     return resolved, None
 
 
@@ -249,3 +271,128 @@ def get_campaign_paths(campaign_id: str) -> dict:
     if error:
         return _safe_error(error)
     return {"ok": True, "campaign_id": campaign_id, "paths": _campaign_paths(root)}
+
+
+def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
+    """Move a campaign into archived_campaigns instead of deleting it."""
+    source_root, error = _resolve_campaign_root(campaign_id)
+    if error:
+        return _safe_error(error)
+    assert source_root is not None
+    if source_root.is_symlink():
+        return _safe_error("Campaign root must not be a symlink.")
+    error = _guard_core_dirs(source_root)
+    if error:
+        return _safe_error(error)
+
+    try:
+        ARCHIVED_CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _safe_error(f"Could not create archived campaign storage: {exc}")
+
+    archive_root, error = _resolve_archived_campaign_root(campaign_id, must_exist=False)
+    if error:
+        return _safe_error(error)
+    assert archive_root is not None
+    if archive_root.exists():
+        return _safe_error("Archived campaign destination already exists; refusing to overwrite.")
+    if ARCHIVED_CAMPAIGNS_DIR.exists() and ARCHIVED_CAMPAIGNS_DIR.is_symlink():
+        return _safe_error("Archived campaign storage must not be a symlink.")
+
+    metadata_path = source_root / "campaign.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _safe_error("Campaign metadata not found.")
+    except (OSError, json.JSONDecodeError) as exc:
+        return _safe_error(f"Could not load campaign metadata: {exc}")
+
+    now = iso_now()
+    archive_reason = reason or "Archived by user request."
+    metadata["archived_at"] = now
+    metadata["archive_reason"] = archive_reason
+    metadata["updated_at"] = now
+    metadata["status"] = "archived"
+    error = _write_json(metadata_path, metadata)
+    if error:
+        return _safe_error(error)
+
+    try:
+        shutil.move(str(source_root), str(archive_root))
+    except OSError as exc:
+        return _safe_error(f"Could not archive campaign: {exc}")
+
+    return {"ok": True, "campaign_id": campaign_id, "archived_path": str(archive_root), "reason": archive_reason}
+
+
+def list_archived_campaigns(limit: int = 50) -> dict:
+    """List archived campaigns."""
+    try:
+        ARCHIVED_CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _safe_error(f"Could not create archived campaign storage: {exc}")
+    if ARCHIVED_CAMPAIGNS_DIR.is_symlink():
+        return _safe_error("Archived campaign storage must not be a symlink.")
+
+    campaigns = []
+    for path in ARCHIVED_CAMPAIGNS_DIR.iterdir():
+        if not path.is_dir() or not is_safe_campaign_id(path.name) or path.is_symlink():
+            continue
+        metadata_path = path / "campaign.json"
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        campaigns.append(metadata)
+
+    campaigns.sort(key=lambda item: item.get("archived_at") or item.get("updated_at") or "", reverse=True)
+    safe_limit = max(1, min(int(limit or 50), 500))
+    return {"ok": True, "campaigns": campaigns[:safe_limit], "count": min(len(campaigns), safe_limit)}
+
+
+def get_archived_campaign(campaign_id: str) -> dict:
+    """Read archived campaign metadata."""
+    root, error = _resolve_archived_campaign_root(campaign_id)
+    if error:
+        return _safe_error(error)
+    assert root is not None
+    if root.is_symlink():
+        return _safe_error("Archived campaign root must not be a symlink.")
+    error = _guard_core_dirs(root)
+    if error:
+        return _safe_error(error)
+    try:
+        metadata = json.loads((root / "campaign.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _safe_error("Archived campaign metadata not found.")
+    except (OSError, json.JSONDecodeError) as exc:
+        return _safe_error(f"Could not load archived campaign metadata: {exc}")
+    return {"ok": True, "campaign": metadata, "path": str(root)}
+
+
+def delete_archived_campaign(campaign_id: str, confirm_campaign_id: str) -> dict:
+    """Permanently delete an archived campaign only when confirmation matches."""
+    if confirm_campaign_id != campaign_id:
+        return _safe_error("Confirmation campaign_id does not match; archived campaign was not deleted.")
+    root, error = _resolve_archived_campaign_root(campaign_id)
+    if error:
+        return _safe_error(error)
+    assert root is not None
+    if root.is_symlink():
+        return _safe_error("Archived campaign root must not be a symlink.")
+    error = _guard_core_dirs(root)
+    if error:
+        return _safe_error(error)
+
+    try:
+        shutil.rmtree(root)
+    except OSError as exc:
+        return _safe_error(f"Could not delete archived campaign: {exc}")
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "deleted": True,
+        "warning": "Archived campaign was permanently deleted from local disk.",
+    }

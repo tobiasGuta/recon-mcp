@@ -5,8 +5,12 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from recon import __version__
+from recon.campaigns import archive_campaign as archive_campaign_logic
 from recon.campaigns import create_campaign as create_campaign_logic
+from recon.campaigns import delete_archived_campaign as delete_archived_campaign_logic
+from recon.campaigns import get_archived_campaign as get_archived_campaign_logic
 from recon.campaigns import get_campaign as get_campaign_logic
+from recon.campaigns import list_archived_campaigns as list_archived_campaigns_logic
 from recon.campaigns import list_campaigns as list_campaigns_logic
 from recon.endpoint_scoring import score_endpoint as score_endpoint_logic
 from recon.endpoint_scoring import score_endpoints as score_endpoints_logic
@@ -100,6 +104,10 @@ AVAILABLE_TOOLS = [
     "analyze_sourcemap_sources_for_campaign",
     "sourcemap_workflow_for_campaign",
     "external_sourcemapper_info",
+    "archive_campaign",
+    "list_archived_campaigns",
+    "get_archived_campaign",
+    "delete_archived_campaign",
 ]
 
 
@@ -249,6 +257,30 @@ def list_campaigns(limit: int = 50) -> dict:
 def get_campaign(campaign_id: str) -> dict:
     """Get campaign metadata for authorized, human-led testing only."""
     return get_campaign_logic(campaign_id)
+
+
+@mcp.tool()
+def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
+    """Archive a campaign instead of deleting evidence for authorized, human-led testing only."""
+    return archive_campaign_logic(campaign_id, reason=reason)
+
+
+@mcp.tool()
+def list_archived_campaigns(limit: int = 50) -> dict:
+    """List archived campaigns for authorized, human-led testing workflows only."""
+    return list_archived_campaigns_logic(limit=limit)
+
+
+@mcp.tool()
+def get_archived_campaign(campaign_id: str) -> dict:
+    """Get archived campaign metadata for authorized, human-led testing only."""
+    return get_archived_campaign_logic(campaign_id)
+
+
+@mcp.tool()
+def delete_archived_campaign(campaign_id: str, confirm_campaign_id: str) -> dict:
+    """Permanently delete only an archived campaign when exact confirmation matches."""
+    return delete_archived_campaign_logic(campaign_id, confirm_campaign_id)
 
 
 @mcp.tool()

@@ -4,7 +4,9 @@ import pytest
 @pytest.fixture
 def campaign_env(monkeypatch, tmp_path):
     root = tmp_path / "campaigns"
+    archive_root = tmp_path / "archived_campaigns"
     monkeypatch.setattr("recon.campaigns.CAMPAIGNS_DIR", root)
+    monkeypatch.setattr("recon.campaigns.ARCHIVED_CAMPAIGNS_DIR", archive_root)
     config = {
         "scope_source": "manual",
         "allowed_domains": ["example.com"],

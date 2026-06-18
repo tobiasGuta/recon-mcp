@@ -53,6 +53,12 @@ Recommended campaign flow:
 
 `generate_campaign_summary` writes `reports/summary.md`, and `generate_manual_test_plan_for_campaign` writes `reports/manual_test_plan.md`. Reports are local Markdown files only; nothing is auto-submitted anywhere.
 
+## Campaign Cleanup
+
+Campaign cleanup is archive-first. `archive_campaign` moves a campaign from `output/campaigns/` to `output/archived_campaigns/` and marks its metadata as archived. This preserves evidence, findings, reports, and audit logs while keeping active campaign lists tidy.
+
+Active campaigns are not directly deleted by MCP for safety. Permanent deletion, when used, only works on archived campaigns and requires the exact campaign ID as confirmation through `delete_archived_campaign`.
+
 ## Finding Pipeline
 
 Possible issues are not vulnerabilities. Every new candidate starts in the hallucination bin at `findings/hallucinations/` with `manual_validation_required: true`.
@@ -232,6 +238,10 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `create_campaign(program: str, target: str, notes: str | None = None)`
 - `list_campaigns(limit: int = 50)`
 - `get_campaign(campaign_id: str)`
+- `archive_campaign(campaign_id: str, reason: str | None = None)`
+- `list_archived_campaigns(limit: int = 50)`
+- `get_archived_campaign(campaign_id: str)`
+- `delete_archived_campaign(campaign_id: str, confirm_campaign_id: str)`
 - `fetch_headers_for_campaign(campaign_id: str, url: str)`
 - `fetch_robots_for_campaign(campaign_id: str, url: str)`
 - `fetch_sitemap_for_campaign(campaign_id: str, url: str)`
