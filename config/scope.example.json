@@ -3,13 +3,25 @@
   "h1_snapshot_dir": "",
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
-  "allowed_domains": [
-    "example.com"
+  "allowed_assets": [
+    {"value": "api.example.com", "match": "exact"},
+    {"value": "*.example.com", "match": "wildcard"}
   ],
+  "allowed_domains": [],
   "user_agent": "ReconMCP/0.1",
   "request_delay_ms": 500,
   "max_requests_per_tool_call": 20,
   "fetch_headers_method": "HEAD",
+  "max_html_bytes": 2097152,
+  "max_javascript_bytes": 5242880,
+  "max_sourcemap_bytes": 5242880,
+  "max_sitemap_bytes": 1048576,
+  "max_robots_bytes": 524288,
+  "max_saved_artifact_bytes": 10485760,
+  "max_extracted_source_files": 500,
+  "max_total_extracted_source_bytes": 20971520,
+  "max_analysis_signals": 1000,
+  "max_endpoint_candidates": 1000,
   "blocked_domains": [
     "localhost",
     "127.0.0.1",

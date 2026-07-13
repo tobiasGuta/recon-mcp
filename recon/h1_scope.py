@@ -60,7 +60,17 @@ def load_h1_snapshots(snapshot_dir: str) -> list[dict]:
     entries: list[dict] = []
     for json_file in json_files:
         try:
-            raw_data = json.loads(json_file.read_text(encoding="utf-8"))
+            if json_file.is_symlink():
+                raise H1ScopeError(f"H1 snapshot must not be a symlink: {json_file}")
+            if json_file.stat().st_size > 10 * 1024 * 1024:
+                raise H1ScopeError(f"H1 snapshot exceeds 10485760 bytes: {json_file}")
+            with json_file.open("rb") as handle:
+                raw = handle.read(10 * 1024 * 1024 + 1)
+            if len(raw) > 10 * 1024 * 1024:
+                raise H1ScopeError(f"H1 snapshot grew beyond 10485760 bytes while reading: {json_file}")
+            raw_data = json.loads(raw)
+        except H1ScopeError:
+            raise
         except (OSError, json.JSONDecodeError) as exc:
             raise H1ScopeError(f"Could not load H1 snapshot {json_file}: {exc}") from exc
 

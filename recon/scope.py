@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from recon.redaction import redact_url
 
 from recon.h1_scope import H1ScopeError, extract_allowed_hosts_from_h1_entries, load_h1_snapshots
 
@@ -18,6 +20,24 @@ DEFAULT_USER_AGENT = "ReconMCP/0.1"
 DEFAULT_REQUEST_DELAY_MS = 500
 DEFAULT_MAX_REQUESTS_PER_TOOL_CALL = 20
 DEFAULT_FETCH_HEADERS_METHOD = "HEAD"
+DEFAULT_LIMITS = {
+    "max_html_bytes": 2 * 1024 * 1024,
+    "max_javascript_bytes": 5 * 1024 * 1024,
+    "max_sourcemap_bytes": 5 * 1024 * 1024,
+    "max_sitemap_bytes": 1024 * 1024,
+    "max_robots_bytes": 512 * 1024,
+    "max_saved_artifact_bytes": 10 * 1024 * 1024,
+    "max_extracted_source_files": 500,
+    "max_total_extracted_source_bytes": 20 * 1024 * 1024,
+    "max_analysis_signals": 1000,
+    "max_endpoint_candidates": 1000,
+}
+LIMIT_BOUNDS = {
+    **{name: (1024, 100 * 1024 * 1024) for name in DEFAULT_LIMITS if name.endswith("_bytes")},
+    "max_extracted_source_files": (1, 10000),
+    "max_analysis_signals": (1, 10000),
+    "max_endpoint_candidates": (1, 10000),
+}
 MAX_BATCH_SIZE = 200
 SCOPE_CACHE_TTL_SECONDS = 30.0
 SUPPORTED_HOST_ASSET_TYPES = {"", "url", "domain", "wildcard", "api"}
@@ -38,8 +58,15 @@ def load_scope() -> dict:
         return _scope_cache
 
     try:
-        with DEFAULT_SCOPE_PATH.open("r", encoding="utf-8") as scope_file:
-            data = json.load(scope_file)
+        if DEFAULT_SCOPE_PATH.is_symlink():
+            raise ScopeError("Invalid scope config: scope path must not be a symlink.")
+        if DEFAULT_SCOPE_PATH.stat().st_size > 1024 * 1024:
+            raise ScopeError("Invalid scope config: file exceeds 1048576 bytes.")
+        with DEFAULT_SCOPE_PATH.open("rb") as scope_file:
+            raw = scope_file.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ScopeError("Invalid scope config: file exceeded 1048576 bytes while reading.")
+        data = json.loads(raw)
     except FileNotFoundError:
         result = {
             "scope_source": "manual",
@@ -49,6 +76,8 @@ def load_scope() -> dict:
             "request_delay_ms": DEFAULT_REQUEST_DELAY_MS,
             "max_requests_per_tool_call": DEFAULT_MAX_REQUESTS_PER_TOOL_CALL,
             "fetch_headers_method": DEFAULT_FETCH_HEADERS_METHOD,
+            "allowed_assets": [],
+            **DEFAULT_LIMITS,
         }
         _scope_cache = result
         _scope_cache_time = now
@@ -56,18 +85,45 @@ def load_scope() -> dict:
     except json.JSONDecodeError as exc:
         raise ScopeError(f"Invalid scope config: {exc}") from exc
 
+    if not isinstance(data, dict):
+        raise ScopeError("Invalid scope config: top-level value must be an object.")
+    try:
+        request_delay_ms = int(data.get("request_delay_ms", DEFAULT_REQUEST_DELAY_MS))
+        max_requests_per_tool_call = int(data.get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL))
+    except (TypeError, ValueError) as exc:
+        raise ScopeError("Invalid scope config: request limits must be integers.") from exc
+    if not 0 <= request_delay_ms <= 60000:
+        raise ScopeError("Invalid scope config: request_delay_ms must be between 0 and 60000.")
+    if not 1 <= max_requests_per_tool_call <= 1000:
+        raise ScopeError("Invalid scope config: max_requests_per_tool_call must be between 1 and 1000.")
+    fetch_headers_method = str(data.get("fetch_headers_method") or DEFAULT_FETCH_HEADERS_METHOD).upper()
+    if fetch_headers_method not in {"HEAD", "GET"}:
+        raise ScopeError("Invalid scope config: fetch_headers_method must be HEAD or GET.")
     result = {
         "scope_source": data.get("scope_source", "manual"),
         "h1_snapshot_dir": data.get("h1_snapshot_dir", ""),
         "include_only_bounty_eligible": bool(data.get("include_only_bounty_eligible", False)),
         "include_only_submission_eligible": bool(data.get("include_only_submission_eligible", False)),
         "allowed_domains": data.get("allowed_domains", []),
+        "allowed_assets": data.get("allowed_assets", []),
         "blocked_domains": data.get("blocked_domains", []),
         "user_agent": str(data.get("user_agent") or DEFAULT_USER_AGENT),
-        "request_delay_ms": int(data.get("request_delay_ms", DEFAULT_REQUEST_DELAY_MS)),
-        "max_requests_per_tool_call": int(data.get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL)),
-        "fetch_headers_method": str(data.get("fetch_headers_method") or DEFAULT_FETCH_HEADERS_METHOD).upper(),
+        "request_delay_ms": request_delay_ms,
+        "max_requests_per_tool_call": max_requests_per_tool_call,
+        "fetch_headers_method": fetch_headers_method,
     }
+    for name, default in DEFAULT_LIMITS.items():
+        raw = data.get(name, default)
+        if isinstance(raw, bool):
+            raise ScopeError(f"Invalid scope config: {name} must be an integer.")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ScopeError(f"Invalid scope config: {name} must be an integer.") from exc
+        minimum, maximum = LIMIT_BOUNDS[name]
+        if value < minimum or value > maximum:
+            raise ScopeError(f"Invalid scope config: {name} must be between {minimum} and {maximum}.")
+        result[name] = value
     _scope_cache = result
     _scope_cache_time = now
     return result
@@ -91,6 +147,12 @@ def normalize_domain(value: str) -> str:
         raw = raw.split(":", 1)[1].strip()
     elif lowered.startswith(":authority:"):
         raw = raw.split(":authority:", 1)[-1].strip()
+
+    literal = raw.strip().strip("[]").rstrip(".")
+    try:
+        return str(ipaddress.ip_address(literal)).lower()
+    except ValueError:
+        pass
 
     parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="https")
     host = parsed.hostname or raw
@@ -122,6 +184,19 @@ def is_private_or_loopback_host(host: str) -> bool:
     )
 
 
+def is_valid_host_asset(host: str) -> bool:
+    """Return True for normalized DNS names or IP literals only."""
+    normalized = normalize_domain(host)
+    try:
+        ipaddress.ip_address(normalized)
+        return True
+    except ValueError:
+        pass
+    if len(normalized) > 253 or "." not in normalized:
+        return False
+    return all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in normalized.split("."))
+
+
 def is_blocked_domain(domain: str, scope: dict | None = None) -> bool:
     """Return True when a domain is blocked by config or IP safety rules."""
     normalized = normalize_domain(domain)
@@ -135,8 +210,53 @@ def is_blocked_domain(domain: str, scope: dict | None = None) -> bool:
 
 
 def _matches_allowed_domain(domain: str, allowed_domain: str) -> bool:
-    """Return True for exact or subdomain matches."""
-    return domain == allowed_domain or domain.endswith(f".{allowed_domain}")
+    """Return True only for an exact legacy manual-domain match."""
+    return domain == allowed_domain
+
+
+def _manual_assets(scope: dict) -> tuple[list[dict], list[str]]:
+    """Normalize manual assets; legacy plain domains are exact unless prefixed by *."""
+    assets: list[dict] = []
+    warnings: list[str] = []
+    raw_assets = scope.get("allowed_assets", [])
+    if raw_assets is None:
+        raw_assets = []
+    if not isinstance(raw_assets, list):
+        return [], ["allowed_assets must be a list; manual scope failed closed."]
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            warnings.append("Ignored malformed allowed_assets entry.")
+            continue
+        original = str(item.get("value") or "").strip()
+        match = str(item.get("match") or "exact").strip().lower()
+        if original.startswith("*."):
+            original_host = original[2:]
+            match = "wildcard"
+        else:
+            original_host = original
+        host = normalize_domain(original_host)
+        if not host or not is_valid_host_asset(host) or match not in {"exact", "wildcard"} or is_private_or_loopback_host(host):
+            warnings.append(f"Ignored unsupported or malformed manual asset: {original or '<empty>'}")
+            continue
+        try:
+            ipaddress.ip_address(host)
+            if match == "wildcard":
+                warnings.append(f"Ignored wildcard IP asset: {original}")
+                continue
+        except ValueError:
+            pass
+        assets.append({"host": host, "match": match, "original_asset": original})
+    legacy = scope.get("allowed_domains", [])
+    if not isinstance(legacy, list):
+        return assets, warnings + ["allowed_domains must be a list; malformed entries were ignored."]
+    for raw in legacy:
+        original = str(raw or "").strip()
+        wildcard = original.startswith("*.")
+        host = normalize_domain(original[2:] if wildcard else original)
+        if not host or not is_valid_host_asset(host) or is_private_or_loopback_host(host):
+            continue
+        assets.append({"host": host, "match": "wildcard" if wildcard else "exact", "original_asset": original})
+    return assets, warnings
 
 
 def _matches_allowed_host_rule(domain: str, host_rule: dict) -> bool:
@@ -321,9 +441,8 @@ def _decision_from_host_rule(input_value: str, normalized: str, item: dict, matc
 
 def _check_manual_scope(domain: str, normalized: str, scope: dict) -> dict:
     """Check a target against manually configured allowed domains."""
-    allowed_domains = [normalize_domain(item) for item in scope.get("allowed_domains", [])]
-    allowed_domains = [item for item in allowed_domains if item]
-    if not allowed_domains:
+    assets, warnings = _manual_assets(scope)
+    if not assets:
         return {
             "ok": False,
             "input": domain,
@@ -332,9 +451,16 @@ def _check_manual_scope(domain: str, normalized: str, scope: dict) -> dict:
             "in_scope": False,
             "scope_source": "manual",
             "reason": "Manual scope has no allowed domains configured; failing closed.",
+            "reason_code": "no_configured_assets",
+            "warnings": warnings,
         }
 
-    matched = next((item for item in allowed_domains if _matches_allowed_domain(normalized, item)), None)
+    matched = next((item for item in assets if item["match"] == "exact" and normalized == item["host"]), None)
+    if matched is None:
+        matched = next(
+            (item for item in assets if item["match"] == "wildcard" and normalized != item["host"] and normalized.endswith(f".{item['host']}")),
+            None,
+        )
 
     if matched:
         return {
@@ -343,9 +469,13 @@ def _check_manual_scope(domain: str, normalized: str, scope: dict) -> dict:
             "domain": normalized,
             "target": normalized,
             "in_scope": True,
-            "matched_scope": matched,
+            "matched_scope": matched["host"],
+            "matched_asset": matched["original_asset"],
+            "match_type": matched["match"],
             "scope_source": "manual",
-            "reason": "Target matches configured allowed scope.",
+            "reason": f"Target matches configured {matched['match']} scope asset.",
+            "reason_code": f"{matched['match']}_scope_match",
+            "warnings": warnings,
         }
 
     return {
@@ -356,6 +486,8 @@ def _check_manual_scope(domain: str, normalized: str, scope: dict) -> dict:
         "in_scope": False,
         "scope_source": "manual",
         "reason": "Target does not match configured allowed scope.",
+        "reason_code": "no_matching_asset",
+        "warnings": warnings,
     }
 
 
@@ -380,13 +512,13 @@ def _resolve_manual_scope(input_value: str, normalized: str, scope: dict, respon
     result["max_severity"] = None
     result["severity_allowed"] = None
     result["program_handle"] = None
-    result["match_type"] = "manual_domain" if result.get("in_scope") else "none"
-    result["exact_matched_asset"] = result.get("matched_scope") if result.get("in_scope") else None
-    result["wildcard_matched_asset"] = None
+    result["match_type"] = result.get("match_type") if result.get("in_scope") else "none"
+    result["exact_matched_asset"] = result.get("matched_asset") if result.get("match_type") == "exact" else None
+    result["wildcard_matched_asset"] = result.get("matched_asset") if result.get("match_type") == "wildcard" else None
     result["suggested_target_label"] = result.get("matched_scope") or normalized
     result["suggested_parent_strategy"] = "manual_scope" if result.get("in_scope") else "none"
     result["confidence"] = "medium" if result.get("in_scope") else "low"
-    result["reason_code"] = "in_scope_bounty_eligible" if result.get("in_scope") else "no_matching_asset"
+    result.setdefault("reason_code", "no_matching_asset")
     result["warnings"] = result.get("warnings", [])
     result = _with_metadata(result, scope, {"entries": [], "warnings": []})
     if response_format == "mcp_interop":
@@ -508,6 +640,7 @@ def _resolve_h1_scope(input_value: str, normalized: str, scope: dict, response_f
 def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
     """Resolve the best configured scope target for a host or URL."""
     normalized = normalize_domain(host_or_url)
+    safe_input = redact_url(host_or_url, redact_all_query_values=True)
     scope = load_scope()
     scope_source = scope.get("scope_source", "manual")
 
@@ -545,7 +678,7 @@ def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
     if is_blocked_domain(normalized, scope):
         result = {
             "ok": True,
-            "input": host_or_url,
+            "input": safe_input,
             "normalized_host": normalized,
             "domain": normalized,
             "target": normalized,
@@ -573,10 +706,23 @@ def resolve_scope_target(host_or_url: str, format: str | None = None) -> dict:
             result["mcp_interop"] = _interop_payload(result)
         return result
 
+    if not is_valid_host_asset(normalized):
+        result = {
+            "ok": False, "input": safe_input, "normalized_host": normalized, "domain": normalized,
+            "target": normalized, "in_scope": False, "bounty_eligible": False,
+            "submission_eligible": False, "eligible_for_bounty": False,
+            "eligible_for_submission": False, "program_handle": None, "max_severity": None,
+            "severity_allowed": None, "match_type": "unsupported", "exact_matched_asset": None,
+            "wildcard_matched_asset": None, "suggested_target_label": None,
+            "suggested_parent_strategy": "none", "confidence": "low", "scope_source": scope_source,
+            "reason_code": "unsupported_asset", "reason": "Input is not a supported hostname or IP asset.", "warnings": [],
+        }
+        return _with_metadata(result, scope, {"entries": [], "warnings": []})
+
     if scope_source == "h1_snapshots":
-        return _resolve_h1_scope(host_or_url, normalized, scope, format)
+        return _resolve_h1_scope(safe_input, normalized, scope, format)
     if scope_source == "manual":
-        return _resolve_manual_scope(host_or_url, normalized, scope, format)
+        return _resolve_manual_scope(safe_input, normalized, scope, format)
 
     result = {
         "ok": False,
@@ -651,10 +797,11 @@ def get_scope_map() -> dict:
     scope = load_scope()
     scope_source = scope.get("scope_source", "manual")
     if scope_source == "manual":
+        assets, asset_warnings = _manual_assets(scope)
         entries = [
             {
-                "asset_identifier": item,
-                "normalized_host": normalize_domain(item),
+                "asset_identifier": item["original_asset"],
+                "normalized_host": item["host"],
                 "asset_type": "manual",
                 "eligible_for_bounty": True,
                 "eligible_for_submission": True,
@@ -662,15 +809,14 @@ def get_scope_map() -> dict:
                 "max_severity": None,
                 "scope_status": "in_scope",
                 "source_file": None,
-                "match_patterns": [normalize_domain(item)],
-                "wildcard": False,
+                "match_patterns": [f"*.{item['host']}" if item["match"] == "wildcard" else item["host"]],
+                "wildcard": item["match"] == "wildcard",
                 "supported": True,
             }
-            for item in scope.get("allowed_domains", [])
-            if normalize_domain(item)
+            for item in assets
         ]
-        result = {"ok": True, "scope_source": "manual", "entries": entries, "count": len(entries), "warnings": []}
-        return _with_metadata(result, scope, {"entries": [], "warnings": []})
+        result = {"ok": True, "scope_source": "manual", "entries": entries, "count": len(entries), "warnings": asset_warnings}
+        return _with_metadata(result, scope, {"entries": [], "warnings": asset_warnings})
 
     if scope_source != "h1_snapshots":
         result = {
@@ -788,8 +934,8 @@ def list_loaded_scope() -> dict:
 
     scope_source = scope.get("scope_source", "manual")
     if scope_source == "manual":
-        allowed_domains = [normalize_domain(item) for item in scope.get("allowed_domains", []) if normalize_domain(item)]
-        if not allowed_domains:
+        assets, asset_warnings = _manual_assets(scope)
+        if not assets:
             result = {
                 "ok": False,
                 "scope_source": "manual",
@@ -799,7 +945,7 @@ def list_loaded_scope() -> dict:
                 "allowed_hosts_count": 0,
                 "program_handles": [],
                 "allowed_hosts": [],
-                "warnings": ["Manual scope has no allowed domains configured; failing closed."],
+                "warnings": ["Manual scope has no allowed assets configured; failing closed.", *asset_warnings],
             }
             return _with_metadata(result, scope, {"entries": [], "warnings": result["warnings"]})
         result = {
@@ -808,12 +954,12 @@ def list_loaded_scope() -> dict:
             "snapshot_directory": None,
             "json_files_loaded": 0,
             "scope_entries_parsed": 0,
-            "allowed_hosts_count": len(allowed_domains),
+            "allowed_hosts_count": len(assets),
             "program_handles": [],
-            "allowed_hosts": sorted(set(allowed_domains)),
-            "warnings": [],
+            "allowed_hosts": sorted({f"*.{item['host']}" if item["match"] == "wildcard" else item["host"] for item in assets}),
+            "warnings": asset_warnings,
         }
-        return _with_metadata(result, scope, {"entries": [], "warnings": []})
+        return _with_metadata(result, scope, {"entries": [], "warnings": asset_warnings})
 
     if scope_source != "h1_snapshots":
         return {

@@ -104,7 +104,7 @@ def test_local_file_size_limit_surfaces_constant(tmp_path, monkeypatch):
     assert "5" in result["error"]
 
 
-def test_collect_js_urls_blocks_above_max_requests_per_tool_call(monkeypatch):
+def test_collect_js_urls_truncates_above_max_requests_per_tool_call(monkeypatch):
     config = {
         "scope_source": "manual",
         "allowed_domains": ["example.com"],
@@ -123,9 +123,10 @@ def test_collect_js_urls_blocks_above_max_requests_per_tool_call(monkeypatch):
 
     result = collect_js_urls("https://example.com/")
 
-    assert result["ok"] is False
+    assert result["ok"] is True
     assert result["max_requests_per_tool_call"] == 2
-    assert "too many javascript urls" in result["error"].lower()
+    assert result["count"] == 2
+    assert result["truncated"] is True
 
 
 def test_collect_js_urls_allows_at_exactly_max_limit(monkeypatch):
@@ -148,3 +149,4 @@ def test_collect_js_urls_allows_at_exactly_max_limit(monkeypatch):
 
     assert result["ok"] is True
     assert result["count"] == 2
+    assert result["truncated"] is False

@@ -10,6 +10,7 @@ def campaign_env(monkeypatch, tmp_path):
     config = {
         "scope_source": "manual",
         "allowed_domains": ["example.com"],
+        "allowed_assets": [{"value": "*.example.com", "match": "wildcard"}],
         "blocked_domains": [],
         "user_agent": "ReconMCP/0.1",
         "request_delay_ms": 0,

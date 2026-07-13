@@ -15,8 +15,8 @@ def test_audit_appends_jsonl(campaign_env):
     assert second["ok"] is True
     audit_path = Path(get_campaign_paths(campaign["campaign_id"])["paths"]["audit_jsonl"])
     lines = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
-    assert [line["tool"] for line in lines] == ["tool_one", "tool_two"]
-    assert lines[1]["warnings"] == ["note"]
+    assert [line["tool"] for line in lines] == ["create_campaign", "tool_one", "tool_two"]
+    assert lines[2]["warnings"] == ["note"]
 
 
 def test_audit_blocks_unsafe_campaign_id(campaign_env):

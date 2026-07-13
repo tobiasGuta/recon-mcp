@@ -7,6 +7,8 @@ from pathlib import Path
 
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths, iso_now, slugify
+from recon.redaction import redact_structure
+from recon.safeio import SafeIOError, atomic_write_bytes, limit, read_bytes_bounded
 
 
 HALLUCINATION = "hallucination"
@@ -93,13 +95,13 @@ def _find_existing_file(campaign_id: str, finding_id: str) -> tuple[Path | None,
 
 
 def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(read_bytes_bounded(path, limit("max_saved_artifact_bytes")))
 
 
 def _write_json(path: Path, finding: dict) -> str | None:
     try:
-        path.write_text(json.dumps(finding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError as exc:
+        atomic_write_bytes(path, (json.dumps(finding, indent=2, sort_keys=True) + "\n").encode("utf-8"), maximum=limit("max_saved_artifact_bytes"))
+    except (OSError, SafeIOError) as exc:
         return f"Could not write finding: {exc}"
     return None
 
@@ -123,6 +125,7 @@ def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
     """Create a possible issue in the hallucination bin for manual validation."""
     if not isinstance(finding, dict):
         return _error("finding must be a dictionary.")
+    finding = redact_structure(finding)
     paths = get_campaign_paths(campaign_id)
     if not paths.get("ok"):
         return _error(paths.get("error", "Could not load campaign paths."))
@@ -172,7 +175,7 @@ def get_finding(campaign_id: str, finding_id: str) -> dict:
     assert path is not None
     try:
         finding = _read_json(path)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, SafeIOError) as exc:
         return _error(f"Could not read finding: {exc}")
     return {"ok": True, "finding": finding, "path": str(path)}
 
@@ -192,7 +195,7 @@ def list_findings(campaign_id: str, status: str | None = None) -> dict:
         for path in sorted(directory.glob("*.json")):
             try:
                 finding = _read_json(path)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, SafeIOError):
                 continue
             findings.append(finding)
     findings.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
@@ -224,7 +227,7 @@ def _transition(
 
     try:
         finding = _read_json(path)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, SafeIOError) as exc:
         return _error(f"Could not read finding: {exc}")
 
     gates = {**DEFAULT_GATES, **(finding.get("promotion_gates") or {})}
@@ -282,7 +285,7 @@ def update_finding_gates(campaign_id: str, finding_id: str, gate_updates: dict, 
     assert path is not None and current_status is not None
     try:
         finding = _read_json(path)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, SafeIOError) as exc:
         return _error(f"Could not read finding: {exc}")
     gates = {**DEFAULT_GATES, **(finding.get("promotion_gates") or {})}
     gates.update({key: bool(value) for key, value in gate_updates.items() if key in DEFAULT_GATES})

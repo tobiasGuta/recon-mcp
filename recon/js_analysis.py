@@ -9,8 +9,10 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from bs4 import BeautifulSoup
 
-from recon.http_fetch import safe_get_text
-from recon.scope import DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, check_scope, load_scope
+from recon.http_fetch import BoundedReadError, safe_get_text
+from recon.redaction import redact_endpoint
+from recon.safeio import SafeIOError, read_text_bounded
+from recon.scope import DEFAULT_LIMITS, DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, check_scope, load_scope
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +36,9 @@ ENDPOINT_PATTERNS = {
 
 def _fetch_text(url: str) -> str:
     """Fetch text from an in-scope URL."""
-    return safe_get_text(url)
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    is_javascript = suffix in ALLOWED_JS_SUFFIXES
+    return safe_get_text(url, limit_name="max_javascript_bytes" if is_javascript else "max_html_bytes", content_type="JavaScript" if is_javascript else "HTML")
 
 
 def get_max_requests_per_tool_call() -> int:
@@ -57,7 +61,7 @@ def collect_js_urls(url: str) -> dict:
         html = _fetch_text(url)
     except ScopeError as exc:
         return {"ok": False, "page_url": url, "error": str(exc)}
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, BoundedReadError) as exc:
         return {"ok": False, "page_url": url, "error": f"HTTP request failed: {exc}"}
 
     soup = BeautifulSoup(html, "html.parser")
@@ -71,9 +75,12 @@ def collect_js_urls(url: str) -> dict:
             js_urls.add(absolute_url)
             if len(js_urls) > get_max_requests_per_tool_call():
                 return {
-                    "ok": False,
+                    "ok": True,
                     "page_url": url,
-                    "error": "Too many JavaScript URLs collected for one tool call.",
+                    "js_urls": sorted(js_urls)[: get_max_requests_per_tool_call()],
+                    "count": get_max_requests_per_tool_call(),
+                    "truncated": True,
+                    "warning": "JavaScript URL results were truncated at the configured limit.",
                     "max_requests_per_tool_call": get_max_requests_per_tool_call(),
                 }
 
@@ -82,6 +89,7 @@ def collect_js_urls(url: str) -> dict:
         "page_url": url,
         "js_urls": sorted(js_urls),
         "count": len(js_urls),
+        "truncated": False,
     }
 
 
@@ -92,10 +100,15 @@ def _read_local_js_file(file_or_url: str) -> str:
         raise OSError("Local JavaScript files must be inside the Recon MCP project directory.")
     if path.suffix.lower() not in ALLOWED_JS_SUFFIXES:
         raise OSError("Local JavaScript input must use a .js, .mjs, .cjs, or .map extension.")
-    if path.stat().st_size > MAX_LOCAL_JS_BYTES:
-        raise OSError(f"Local JavaScript input exceeds MAX_LOCAL_JS_BYTES ({MAX_LOCAL_JS_BYTES}).")
-
-    return path.read_text(encoding="utf-8", errors="replace")
+    if path.is_symlink():
+        raise OSError("Local JavaScript input must not be a symlink.")
+    maximum = min(int(load_scope().get("max_javascript_bytes", DEFAULT_LIMITS["max_javascript_bytes"])), MAX_LOCAL_JS_BYTES)
+    if path.stat().st_size > maximum:
+        raise OSError(f"Local JavaScript input exceeds MAX_LOCAL_JS_BYTES/configured maximum ({maximum}).")
+    try:
+        return read_text_bounded(path, maximum)
+    except SafeIOError as exc:
+        raise OSError(str(exc)) from exc
 
 
 def _read_js_input(file_or_url: str) -> tuple[str, str]:
@@ -131,23 +144,33 @@ def parse_sourcemap_references(js_text: str, js_url: str | None = None) -> list[
             kind = "data_uri"
             reason = "inline data URI source map; manual review only"
             safe_to_download = False
+            display_raw = "<inline-data-uri-redacted>"
         elif lowered.startswith(("http://", "https://")):
             kind = "absolute"
             resolved_url = raw
             reason = "absolute source map URL"
             safe_to_download = True
+            display_raw = redact_endpoint(raw)
         elif js_url:
             kind = "relative"
             resolved_url = urljoin(js_url, raw)
             reason = "relative source map resolved against JS URL"
             safe_to_download = True
+            display_raw = redact_endpoint(raw)
         else:
             kind = "unknown"
             reason = "relative source map cannot be resolved without js_url"
             safe_to_download = False
+            display_raw = redact_endpoint(raw)
+        if resolved_url:
+            redacted_resolved = redact_endpoint(resolved_url)
+            if redacted_resolved != resolved_url:
+                safe_to_download = False
+                reason += "; sensitive URL values were redacted and will not be requested"
+            resolved_url = redacted_resolved
         references.append(
             {
-                "raw": raw,
+                "raw": display_raw,
                 "kind": kind,
                 "resolved_url": resolved_url,
                 "safe_to_download": safe_to_download,
@@ -168,6 +191,8 @@ def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) 
                 js_text = _read_local_js_file(file_or_url)
             elif normalized_source_type == "raw":
                 js_text = file_or_url
+                if len(js_text.encode("utf-8")) > int(load_scope().get("max_javascript_bytes", DEFAULT_LIMITS["max_javascript_bytes"])):
+                    return {"ok": False, "source": "provided_raw", "source_type": "raw", "error": "Raw JavaScript exceeds configured maximum."}
             else:
                 return {
                     "ok": False,
@@ -182,18 +207,25 @@ def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) 
             js_text, resolved_source_type = _read_js_input(file_or_url)
     except ScopeError as exc:
         return {"ok": False, "source": file_or_url, "error": str(exc)}
-    except (OSError, httpx.HTTPError) as exc:
+    except (OSError, httpx.HTTPError, BoundedReadError) as exc:
         return {"ok": False, "source": file_or_url, "error": f"Could not read JavaScript: {exc}"}
 
     seen_values = set()
     endpoints = []
+    maximum = int(load_scope().get("max_endpoint_candidates", DEFAULT_LIMITS["max_endpoint_candidates"]))
+    truncated = False
     for category, pattern in ENDPOINT_PATTERNS.items():
         for match in pattern.finditer(js_text):
-            value = match.group("value").strip().rstrip(");,")
+            value = redact_endpoint(match.group("value").strip().rstrip(");,"))
             if value in seen_values:
                 continue
             seen_values.add(value)
             endpoints.append({"category": _categorize_endpoint(category, value), "value": value})
+            if len(endpoints) >= maximum:
+                truncated = True
+                break
+        if truncated:
+            break
 
     endpoints.sort(key=lambda item: (item["category"], item["value"]))
     return {
@@ -202,5 +234,6 @@ def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) 
         "source_type": resolved_source_type,
         "endpoints": endpoints,
         "count": len(endpoints),
+        "truncated": truncated,
         "notes": ["Possible endpoints require manual validation; no vulnerability is implied."],
     }

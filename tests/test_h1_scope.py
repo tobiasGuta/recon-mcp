@@ -1,6 +1,8 @@
 import json
+import pytest
 
 from recon.h1_scope import (
+    H1ScopeError,
     _is_private_or_loopback_host,
     extract_allowed_hosts_from_h1_entries,
     load_h1_snapshots,
@@ -45,6 +47,14 @@ def test_loads_valid_h1_snapshot_file(tmp_path):
     assert len(entries) == 1
     assert entries[0]["_program_handle"] == "security"
     assert entries[0]["_source_file"].endswith("security.json")
+
+
+def test_rejects_oversized_h1_snapshot(tmp_path):
+    snapshot = tmp_path / "oversized.json"
+    snapshot.write_bytes(b"[" + b" " * (10 * 1024 * 1024) + b"]")
+
+    with pytest.raises(H1ScopeError, match="exceeds"):
+        load_h1_snapshots(str(tmp_path))
 
 
 def test_extracts_hostname_from_url():

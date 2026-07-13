@@ -15,6 +15,7 @@ from recon.campaigns import file_timestamp, get_campaign_paths, slugify
 from recon.endpoint_scoring import score_endpoints
 from recon.js_analysis import extract_endpoints_from_js, parse_sourcemap_references
 from recon.memory import record_negative_result
+from recon.safeio import SafeIOError, atomic_write_bytes, limit, read_text_bounded, write_artifact_bytes, write_flat_json_artifact
 from recon.scope import ScopeError, resolve_scope_target
 
 
@@ -106,10 +107,15 @@ def _sourcemap_dirs(campaign_id: str) -> dict:
 
 def _write_json(path: Path, payload: dict) -> dict:
     try:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError as exc:
+        campaign_id = str(payload.get("campaign_id") or "")
+        if campaign_id:
+            saved = write_flat_json_artifact(campaign_id, str(payload.get("tool") or "sourcemap_analysis"), path, payload, limits_applied={"max_saved_artifact_bytes": limit("max_saved_artifact_bytes")})
+        else:
+            atomic_write_bytes(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), maximum=limit("max_saved_artifact_bytes"))
+            saved = {"path": str(path)}
+    except (OSError, SafeIOError) as exc:
         return _error(f"Could not write JSON artifact: {exc}")
-    return {"ok": True, "path": str(path)}
+    return {"ok": True, **saved}
 
 
 def _analysis_path(dirs: dict, label: str) -> Path:
@@ -130,6 +136,10 @@ def detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str) -> d
         return dirs
     try:
         js_text = http_fetch.safe_get_text(js_url)
+    except http_fetch.BoundedReadError as exc:
+        result = {**exc.as_result(js_url), "campaign_id": campaign_id, "js_url": js_url}
+        write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=js_url, ok=False, warnings=[result["error"]], metadata={"configured_maximum_bytes": exc.maximum, "bytes_observed": exc.observed, "rejected": True})
+        return result
     except (ScopeError, httpx.HTTPError) as exc:
         result = {"ok": False, "campaign_id": campaign_id, "js_url": js_url, "error": f"Could not fetch JavaScript safely: {exc}"}
         write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=js_url, ok=False, warnings=[result["error"]])
@@ -188,24 +198,13 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
         return result
 
     try:
-        with http_fetch._client() as client:
-            response = http_fetch._safe_get(client, sourcemap_url)
-            response.raise_for_status()
-            content = response.content
+        content, response = http_fetch.safe_get_bytes(sourcemap_url, limit("max_sourcemap_bytes"), content_type="source map")
+    except http_fetch.BoundedReadError as exc:
+        result = {**exc.as_result(sourcemap_url), "campaign_id": campaign_id, "sourcemap_url": sourcemap_url, "scope_decision": scope_decision}
+        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]], metadata={"configured_maximum_bytes": exc.maximum, "bytes_observed": exc.observed, "rejected": True})
+        return result
     except (ScopeError, httpx.HTTPError) as exc:
         result = {"ok": False, "campaign_id": campaign_id, "sourcemap_url": sourcemap_url, "error": f"Could not download source map safely: {exc}", "scope_decision": scope_decision}
-        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]])
-        return result
-
-    if len(content) > MAX_SOURCEMAP_BYTES:
-        result = {
-            "ok": False,
-            "campaign_id": campaign_id,
-            "sourcemap_url": sourcemap_url,
-            "error": f"Source map exceeds MAX_SOURCEMAP_BYTES ({MAX_SOURCEMAP_BYTES}); not saved.",
-            "size_bytes": len(content),
-            "scope_decision": scope_decision,
-        }
         write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]])
         return result
 
@@ -220,8 +219,8 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
     map_path = dirs["maps"] / f"{file_timestamp()}-{label}.map"
     metadata_path = _analysis_path(dirs, f"{label}-download")
     try:
-        map_path.write_bytes(content)
-    except OSError as exc:
+        map_saved = write_artifact_bytes(campaign_id, "download_sourcemap_for_campaign", map_path, content, maximum=limit("max_sourcemap_bytes"), limits_applied={"max_sourcemap_bytes": limit("max_sourcemap_bytes")})
+    except (OSError, SafeIOError) as exc:
         return _error(f"Could not save source map: {exc}")
 
     sources = _collect_sources(sourcemap)
@@ -240,7 +239,7 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
     if not save.get("ok"):
         return save
     write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=True, scope_decision=scope_decision, result_path=str(map_path))
-    return {**metadata, "metadata_path": str(metadata_path)}
+    return {**metadata, "artifact_uuid": map_saved["artifact_uuid"], "artifact_sha256": map_saved["sha256"], "integrity_metadata_path": map_saved["metadata_path"], "metadata_path": str(metadata_path)}
 
 
 def _collect_sources(sourcemap: dict) -> list[dict]:
@@ -303,14 +302,17 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
     if not dirs.get("ok"):
         return dirs
     maps_dir = dirs["maps"]
-    path = Path(map_path).expanduser().resolve()
+    raw_path = Path(map_path).expanduser()
+    if raw_path.is_symlink():
+        return _error("map_path must not be a symlink.")
+    path = raw_path.resolve()
     if not path.is_relative_to(maps_dir):
         return _error("map_path must be inside the campaign source map maps directory.")
     if path.is_symlink():
         return _error("map_path must not be a symlink.")
     try:
-        sourcemap = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        sourcemap = json.loads(read_text_bounded(path, limit("max_sourcemap_bytes")))
+    except (OSError, json.JSONDecodeError, SafeIOError) as exc:
         return _error(f"Could not read source map: {exc}")
     if not isinstance(sourcemap, dict):
         return _error("Source map must be a JSON object.")
@@ -319,6 +321,23 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
     if sourcemap.get("sections"):
         warnings.append("Sectioned source maps are partially supported; nested map sources were extracted when embedded.")
     sources = _collect_sources(sourcemap)
+    max_files = limit("max_extracted_source_files")
+    max_total_bytes = limit("max_total_extracted_source_bytes")
+    content_sources = [item for item in sources if item.get("content") is not None]
+    total_source_bytes = sum(len(str(item.get("content")).encode("utf-8", errors="replace")) for item in content_sources)
+    if len(content_sources) > max_files or total_source_bytes > max_total_bytes:
+        result = {
+            "ok": False,
+            "error": "Source map extraction rejected because configured file or total-byte limits were exceeded.",
+            "configured_max_files": max_files,
+            "configured_max_total_bytes": max_total_bytes,
+            "files_observed": len(content_sources),
+            "bytes_observed": total_source_bytes,
+            "truncated": False,
+            "rejected": True,
+        }
+        write_audit_event(campaign_id, "extract_sourcemap_sources_for_campaign", ok=False, warnings=[result["error"]], metadata={key: value for key, value in result.items() if key not in {"error", "ok"}})
+        return result
     map_slug = slugify(path.stem, fallback="sourcemap", max_length=90)
     extracted_dir = (dirs["extracted"] / map_slug).resolve()
     if not extracted_dir.is_relative_to(dirs["extracted"]):
@@ -349,14 +368,14 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
             continue
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(str(content), encoding="utf-8", errors="replace")
+            atomic_write_bytes(destination, str(content).encode("utf-8", errors="replace"), maximum=max_total_bytes)
             files_written += 1
         except OSError as exc:
             warnings.append(f"Could not write extracted source {source.get('source')}: {exc}")
 
     try:
-        (extracted_dir / "sources-index.json").write_text(json.dumps(source_index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError as exc:
+        atomic_write_bytes(extracted_dir / "sources-index.json", (json.dumps(source_index, indent=2, sort_keys=True) + "\n").encode("utf-8"), maximum=limit("max_saved_artifact_bytes"))
+    except (OSError, SafeIOError) as exc:
         warnings.append(f"Could not write source index: {exc}")
 
     metadata = {
@@ -380,7 +399,10 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
 def _safe_analysis_roots(dirs: dict, extracted_dir: str | None) -> tuple[list[Path], str | None]:
     extracted_root = dirs["extracted"]
     if extracted_dir:
-        root = Path(extracted_dir).expanduser().resolve()
+        raw_root = Path(extracted_dir).expanduser()
+        if raw_root.is_symlink():
+            return [], "extracted_dir must not be a symlink."
+        root = raw_root.resolve()
         if not root.is_relative_to(extracted_root):
             return [], "extracted_dir must be inside the campaign source map extracted directory."
         if root.is_symlink():
@@ -419,11 +441,11 @@ def analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str 
             if path.name == "sources-index.json":
                 continue
             try:
-                if path.stat().st_size > MAX_EXTRACTED_SOURCE_BYTES:
+                if path.stat().st_size > min(MAX_EXTRACTED_SOURCE_BYTES, limit("max_javascript_bytes")):
                     warnings.append(f"Skipped oversized extracted source: {path.name}")
                     continue
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
+                text = read_text_bounded(path, min(MAX_EXTRACTED_SOURCE_BYTES, limit("max_javascript_bytes")))
+            except (OSError, SafeIOError) as exc:
                 warnings.append(f"Could not read extracted source {path.name}: {exc}")
                 continue
             files_analyzed += 1
@@ -445,15 +467,22 @@ def analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str 
                                 "manual_validation_required": True,
                             }
                         )
+                        if len(signals) >= limit("max_analysis_signals"):
+                            break
+                if len(signals) >= limit("max_analysis_signals"):
+                    break
+            if len(endpoint_candidates) >= limit("max_endpoint_candidates") or len(signals) >= limit("max_analysis_signals"):
+                warnings.append("Analysis results were truncated at configured limits.")
+                break
 
     scored = score_endpoints([item.get("value", "") for item in endpoint_candidates]).get("endpoints", [])
     payload = {
         "ok": True,
         "campaign_id": campaign_id,
         "files_analyzed": files_analyzed,
-        "endpoint_candidates": endpoint_candidates,
-        "scored_endpoints": scored,
-        "signals": signals,
+        "endpoint_candidates": endpoint_candidates[: limit("max_endpoint_candidates")],
+        "scored_endpoints": scored[: limit("max_endpoint_candidates")],
+        "signals": signals[: limit("max_analysis_signals")],
         "warnings": warnings,
     }
     path = _analysis_path(dirs, "sourcemap-source-analysis")

@@ -14,6 +14,11 @@ from recon.campaigns import list_archived_campaigns as list_archived_campaigns_l
 from recon.campaigns import list_campaigns as list_campaigns_logic
 from recon.endpoint_scoring import score_endpoint as score_endpoint_logic
 from recon.endpoint_scoring import score_endpoints as score_endpoints_logic
+from recon.contracts import extract_api_contracts_for_campaign as extract_api_contracts_for_campaign_logic
+from recon.differential import compare_campaign_recon as compare_campaign_recon_logic
+from recon.evidence_graph import get_evidence_graph_summary as get_evidence_graph_summary_logic
+from recon.evidence_graph import import_dirfuzz_evidence_for_campaign as import_dirfuzz_evidence_for_campaign_logic
+from recon.evidence_graph import query_evidence_graph as query_evidence_graph_logic
 from recon.findings import create_finding_candidate as create_finding_candidate_logic
 from recon.findings import demote_finding as demote_finding_logic
 from recon.findings import get_finding as get_finding_logic
@@ -23,6 +28,9 @@ from recon.findings import reject_finding as reject_finding_logic
 from recon.http_fetch import fetch_headers as fetch_headers_logic
 from recon.http_fetch import fetch_robots as fetch_robots_logic
 from recon.http_fetch import fetch_sitemap as fetch_sitemap_logic
+from recon.imports import import_burp_xml_for_campaign as import_burp_xml_for_campaign_logic
+from recon.imports import import_har_for_campaign as import_har_for_campaign_logic
+from recon.integrity import verify_campaign_artifacts as verify_campaign_artifacts_logic
 from recon.js_analysis import collect_js_urls as collect_js_urls_logic
 from recon.js_analysis import extract_endpoints_from_js as extract_endpoints_from_js_logic
 from recon.memory import list_negative_results as list_negative_results_logic
@@ -30,12 +38,15 @@ from recon.memory import record_negative_result as record_negative_result_logic
 from recon.notes import create_campaign_evidence_note as create_campaign_evidence_note_logic
 from recon.notes import create_evidence_note as create_evidence_note_logic
 from recon.planner import generate_manual_test_plan as generate_manual_test_plan_logic
+from recon.passive import discover_subdomains_passive_for_campaign as discover_subdomains_passive_for_campaign_logic
 from recon.reports import generate_report_candidate_markdown as generate_report_candidate_markdown_logic
 from recon.scope import check_scope as check_scope_logic
 from recon.scope import check_scope_batch as check_scope_batch_logic
 from recon.scope import explain_scope_decision as explain_scope_decision_logic
 from recon.scope import get_scope_map as get_scope_map_logic
 from recon.scope import list_loaded_scope as list_loaded_scope_logic
+from recon.scope import DEFAULT_LIMITS, ScopeError, load_scope
+from recon.sensitive import scan_sensitive_artifacts_for_campaign as scan_sensitive_artifacts_for_campaign_logic
 from recon.scope import recommend_bugmap_parent as recommend_bugmap_parent_logic
 from recon.scope import resolve_scope_target as resolve_scope_target_logic
 from recon.sourcemaps import analyze_sourcemap_sources_for_campaign as analyze_sourcemap_sources_for_campaign_logic
@@ -108,19 +119,40 @@ AVAILABLE_TOOLS = [
     "list_archived_campaigns",
     "get_archived_campaign",
     "delete_archived_campaign",
+    "scan_sensitive_artifacts_for_campaign",
+    "extract_api_contracts_for_campaign",
+    "get_evidence_graph_summary",
+    "query_evidence_graph",
+    "import_dirfuzz_evidence_for_campaign",
+    "discover_subdomains_passive_for_campaign",
+    "compare_campaign_recon",
+    "import_har_for_campaign",
+    "import_burp_xml_for_campaign",
+    "verify_campaign_artifacts",
+    "nuclei_integration_info",
 ]
 
 
 @mcp.tool()
 def health() -> dict:
     """Return health for safe recon helpers for authorized testing only."""
+    try:
+        config = load_scope()
+        config_error = None
+    except ScopeError as exc:
+        config = DEFAULT_LIMITS
+        config_error = str(exc)
     return {
-        "ok": True,
+        "ok": config_error is None,
         "project": "recon-mcp",
         "version": __version__,
         "available_tools": AVAILABLE_TOOLS,
         "safety_note": "This server provides scoped, low-risk recon helpers only.",
         "dirfuzz_note": "Directory fuzzing is delegated to the separate Go DirFuzz MCP server.",
+        "nuclei_note": "Nuclei execution is intentionally outside this MCP trust boundary.",
+        "processing_limits": {name: int(config.get(name, default)) for name, default in DEFAULT_LIMITS.items()},
+        "scope_compatibility": "Legacy allowed_domains entries are exact; use *.example.com or allowed_assets match=wildcard explicitly.",
+        "configuration_error": config_error,
     }
 
 
@@ -444,6 +476,83 @@ def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
 def external_sourcemapper_info() -> dict:
     """Explain safe local-only external sourcemapper usage; does not execute it."""
     return external_sourcemapper_info_logic()
+
+
+@mcp.tool()
+def scan_sensitive_artifacts_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
+    """Locally scan approved campaign sources for redacted manual-review candidates only."""
+    return scan_sensitive_artifacts_for_campaign_logic(campaign_id, extracted_dir=extracted_dir)
+
+
+@mcp.tool()
+def extract_api_contracts_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
+    """Deterministically extract uncertain API contract leads from campaign-local sources."""
+    return extract_api_contracts_for_campaign_logic(campaign_id, extracted_dir=extracted_dir)
+
+
+@mcp.tool()
+def get_evidence_graph_summary(campaign_id: str) -> dict:
+    """Return bounded counts for a campaign evidence graph."""
+    return get_evidence_graph_summary_logic(campaign_id)
+
+
+@mcp.tool()
+def query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit: int = 100) -> dict:
+    """Return a bounded graph neighborhood around one node."""
+    return query_evidence_graph_logic(campaign_id, node_uuid, depth=depth, limit=limit)
+
+
+@mcp.tool()
+def import_dirfuzz_evidence_for_campaign(campaign_id: str, analysis_path: str | None = None) -> dict:
+    """Import already saved DirFuzz observations into the shared evidence graph."""
+    return import_dirfuzz_evidence_for_campaign_logic(campaign_id, analysis_path=analysis_path)
+
+
+@mcp.tool()
+def discover_subdomains_passive_for_campaign(campaign_id: str, root_domain: str, providers: list[str] | None = None, max_results: int = 500, resolve_dns: bool = False) -> dict:
+    """Query fixed passive providers without sending HTTP requests to discovered hosts."""
+    return discover_subdomains_passive_for_campaign_logic(campaign_id, root_domain, providers=providers, max_results=max_results, resolve_dns=resolve_dns)
+
+
+@mcp.tool()
+def compare_campaign_recon(campaign_id: str, baseline_campaign_id: str) -> dict:
+    """Compare normalized redacted campaign artifacts as recon differences only."""
+    return compare_campaign_recon_logic(campaign_id, baseline_campaign_id)
+
+
+@mcp.tool()
+def import_har_for_campaign(campaign_id: str, har_path: str) -> dict:
+    """Safely summarize a campaign-local HAR without replaying requests or retaining bodies."""
+    return import_har_for_campaign_logic(campaign_id, har_path)
+
+
+@mcp.tool()
+def import_burp_xml_for_campaign(campaign_id: str, xml_path: str) -> dict:
+    """Safely summarize campaign-local Burp XML without replaying requests."""
+    return import_burp_xml_for_campaign_logic(campaign_id, xml_path)
+
+
+@mcp.tool()
+def verify_campaign_artifacts(campaign_id: str) -> dict:
+    """Read-only verification of campaign artifact integrity metadata."""
+    return verify_campaign_artifacts_logic(campaign_id)
+
+
+@mcp.tool()
+def nuclei_integration_info() -> dict:
+    """Describe the non-executing trust boundary for a future separate Nuclei MCP."""
+    return {
+        "ok": True,
+        "executed": False,
+        "message": "Recon MCP does not execute Nuclei. A future separate MCP must build a one-target plan for explicit human approval.",
+        "required_controls": [
+            "exact reviewed template-ID allowlist", "pinned local signed templates", "HTTP-only templates",
+            "no code, JavaScript, headless, file, TCP, workflow, fuzzing, DAST, OAST, remote templates, or AI-generated templates",
+            "no local-file access", "private-network restrictions", "strict rate/concurrency/process limits",
+            "JSONL result import into an existing Recon MCP campaign",
+        ],
+        "safety_boundary": "Template tags are metadata, never the primary safety boundary.",
+    }
 
 
 if __name__ == "__main__":

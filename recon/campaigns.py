@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from recon.scope import normalize_domain, resolve_scope_target
+from recon.redaction import redact_structure
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -16,7 +19,10 @@ CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "campaigns"
 ARCHIVED_CAMPAIGNS_DIR = PROJECT_ROOT / "output" / "archived_campaigns"
 SAFETY_MODEL = "authorized_low_risk_human_led"
 CAMPAIGN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,159}$")
-RECON_SUBDIRS = ["headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz", "sourcemaps"]
+RECON_SUBDIRS = [
+    "headers", "robots", "sitemap", "js_urls", "endpoints", "dirfuzz", "sourcemaps",
+    "sensitive", "contracts", "graph", "passive", "diffs", "imports",
+]
 FINDING_SUBDIRS = [
     "hallucinations",
     "needs_manual_validation",
@@ -105,10 +111,13 @@ def _reject_symlink(path: Path, label: str) -> str | None:
 def _guard_core_dirs(root: Path) -> str | None:
     checks = {
         "Campaign root": root,
+        "Recon directory": root / "recon",
         "Evidence directory": root / "evidence",
         "Findings directory": root / "findings",
         "Reports directory": root / "reports",
         "Memory directory": root / "memory",
+        "Imports directory": root / "imports",
+        **{f"Recon {name} directory": root / "recon" / name for name in RECON_SUBDIRS},
     }
     for label, path in checks.items():
         error = _reject_symlink(path, label)
@@ -126,6 +135,7 @@ def _campaign_paths(root: Path) -> dict:
         "recon": {name: str(root / "recon" / name) for name in RECON_SUBDIRS},
         "findings": {name: str(root / "findings" / name) for name in FINDING_SUBDIRS},
         "evidence": str(root / "evidence"),
+        "imports": str(root / "imports"),
         "memory": str(root / "memory"),
         "negative_results_jsonl": str(root / "memory" / "negative_results.jsonl"),
         "reports": str(root / "reports"),
@@ -149,6 +159,7 @@ def _create_layout(root: Path) -> str | None:
         for name in FINDING_SUBDIRS:
             (root / "findings" / name).mkdir()
         (root / "evidence").mkdir()
+        (root / "imports").mkdir()
         (root / "memory").mkdir()
         (root / "reports").mkdir()
     except OSError as exc:
@@ -167,11 +178,39 @@ def _unique_campaign_id(program: str, normalized_host: str) -> str:
 
 
 def _write_json(path: Path, payload: dict) -> str | None:
+    temp_path: Path | None = None
     try:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > 2 * 1024 * 1024:
+            return f"Could not write {path.name}: content exceeds 2097152 bytes."
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temp_path = Path(name)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
     except OSError as exc:
         return f"Could not write {path.name}: {exc}"
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
     return None
+
+
+def _read_json(path: Path, maximum: int = 2 * 1024 * 1024) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise OSError("JSON input must be a regular non-symlink file.")
+    if path.stat().st_size > maximum:
+        raise OSError(f"JSON input exceeds {maximum} bytes.")
+    with path.open("rb") as handle:
+        raw = handle.read(maximum + 1)
+    if len(raw) > maximum:
+        raise OSError(f"JSON input exceeded {maximum} bytes while reading.")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise json.JSONDecodeError("Expected JSON object", raw.decode("utf-8", errors="replace"), 0)
+    return value
 
 
 def create_campaign(program: str, target: str, notes: str | None = None) -> dict:
@@ -208,12 +247,17 @@ def create_campaign(program: str, target: str, notes: str | None = None) -> dict
         "updated_at": now,
         "scope_decision": scope_decision,
         "safety_model": SAFETY_MODEL,
-        "notes": [notes] if notes else [],
+        "notes": [redact_structure(notes)] if notes else [],
     }
     for path, payload in ((root / "campaign.json", metadata), (root / "scope.json", scope_decision)):
         error = _write_json(path, payload)
         if error:
             return _safe_error(error)
+
+    # Local import avoids an audit/campaign module cycle during initialization.
+    from recon.audit import write_audit_event
+
+    write_audit_event(campaign_id, "create_campaign", target=target, ok=True, scope_decision=scope_decision, result_path=str(root / "campaign.json"), metadata={"program": str(program or "")})
 
     return {"ok": True, "campaign_id": campaign_id, "path": str(root), "scope_decision": scope_decision}
 
@@ -233,7 +277,7 @@ def list_campaigns(limit: int = 50) -> dict:
         if not metadata_path.exists():
             continue
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = _read_json(metadata_path)
         except (OSError, json.JSONDecodeError):
             continue
         campaigns.append(metadata)
@@ -253,7 +297,7 @@ def get_campaign(campaign_id: str) -> dict:
     if error:
         return _safe_error(error)
     try:
-        metadata = json.loads((root / "campaign.json").read_text(encoding="utf-8"))
+        metadata = _read_json(root / "campaign.json")
     except FileNotFoundError:
         return _safe_error("Campaign metadata not found.")
     except (OSError, json.JSONDecodeError) as exc:
@@ -301,7 +345,7 @@ def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
 
     metadata_path = source_root / "campaign.json"
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = _read_json(metadata_path)
     except FileNotFoundError:
         return _safe_error("Campaign metadata not found.")
     except (OSError, json.JSONDecodeError) as exc:
@@ -342,7 +386,7 @@ def list_archived_campaigns(limit: int = 50) -> dict:
         if not metadata_path.exists():
             continue
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = _read_json(metadata_path)
         except (OSError, json.JSONDecodeError):
             continue
         campaigns.append(metadata)
@@ -364,7 +408,7 @@ def get_archived_campaign(campaign_id: str) -> dict:
     if error:
         return _safe_error(error)
     try:
-        metadata = json.loads((root / "campaign.json").read_text(encoding="utf-8"))
+        metadata = _read_json(root / "campaign.json")
     except FileNotFoundError:
         return _safe_error("Archived campaign metadata not found.")
     except (OSError, json.JSONDecodeError) as exc:

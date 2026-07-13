@@ -10,11 +10,13 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
+from recon.redaction import redact_text, redact_url, url_contains_sensitive_data
 
 from recon.scope import (
     DEFAULT_FETCH_HEADERS_METHOD,
     DEFAULT_REQUEST_DELAY_MS,
     DEFAULT_USER_AGENT,
+    DEFAULT_LIMITS,
     ScopeError,
     assert_in_scope,
     is_private_or_loopback_host,
@@ -38,6 +40,28 @@ SECURITY_HEADERS = [
 ]
 
 
+class BoundedReadError(ValueError):
+    """Raised as soon as a streamed response exceeds its configured limit."""
+
+    def __init__(self, maximum: int, observed: int, *, content_type: str) -> None:
+        self.maximum = maximum
+        self.observed = observed
+        self.content_type = content_type
+        super().__init__(f"{content_type} response exceeds configured maximum of {maximum} bytes.")
+
+    def as_result(self, url: str) -> dict:
+        return {
+            "ok": False,
+            "url": url,
+            "error": str(self),
+            "error_code": "response_too_large",
+            "configured_maximum_bytes": self.maximum,
+            "bytes_observed": self.observed,
+            "truncated": True,
+            "rejected": True,
+        }
+
+
 def _origin_url(url: str) -> str:
     """Return the origin for a URL."""
     parts = urlsplit(url)
@@ -49,13 +73,29 @@ def _headers_dict(response: httpx.Response) -> dict:
     return {key: value for key, value in response.headers.items()}
 
 
-def _truncate_response_text(response: httpx.Response, max_bytes: int) -> tuple[str, bool]:
-    """Return response text capped by byte length."""
-    content = response.content
-    if len(content) <= max_bytes:
-        return response.text, False
-    encoding = response.encoding or "utf-8"
-    return content[:max_bytes].decode(encoding, errors="replace"), True
+def get_limit(name: str) -> int:
+    """Return one validated processing limit from scope configuration."""
+    return int(load_scope().get(name, DEFAULT_LIMITS[name]))
+
+
+def _read_bounded(response: httpx.Response, maximum: int, *, content_type: str) -> bytes:
+    """Read a response incrementally and stop before retaining an oversized body."""
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = 0
+        if declared > maximum:
+            raise BoundedReadError(maximum, declared, content_type=content_type)
+    chunks: list[bytes] = []
+    observed = 0
+    for chunk in response.iter_bytes():
+        observed += len(chunk)
+        if observed > maximum:
+            raise BoundedReadError(maximum, observed, content_type=content_type)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _client() -> httpx.Client:
@@ -69,7 +109,7 @@ def _client() -> httpx.Client:
 
 def _error_result(url: str, message: str) -> dict:
     """Build a consistent error response."""
-    return {"ok": False, "url": url, "error": message}
+    return {"ok": False, "url": redact_url(url), "error": redact_text(message)}
 
 
 def get_user_agent() -> str:
@@ -135,15 +175,14 @@ def _safe_request(client: httpx.Client, method: str, url: str, *, headers_only: 
     """Request a URL and validate every redirect target before following it."""
     current_url = url
     for _ in range(MAX_REDIRECTS + 1):
+        if url_contains_sensitive_data(current_url):
+            raise ScopeError("URL contains credential-like user information or sensitive query values; request rejected.")
         assert_in_scope(current_url)
         assert_resolved_host_is_public(current_url)
         _request_delay()
-        if headers_only and method.upper() == "GET":
-            request = client.build_request("GET", current_url, headers={"Range": "bytes=0-0"})
-            response = client.send(request, stream=True)
-            response.close()
-        else:
-            response = client.request(method.upper(), current_url)
+        headers = {"Range": "bytes=0-0"} if headers_only and method.upper() == "GET" else None
+        request = client.build_request(method.upper(), current_url, headers=headers)
+        response = client.send(request, stream=True)
         if not response.is_redirect:
             return response
 
@@ -153,10 +192,12 @@ def _safe_request(client: httpx.Client, method: str, url: str, *, headers_only: 
 
         next_url = urljoin(str(response.url), location)
         try:
-            assert_in_scope(next_url)
             assert_resolved_host_is_public(next_url)
+            assert_in_scope(next_url)
         except ScopeError as exc:
-            raise ScopeError(f"Redirect blocked because target is unsafe or out of scope: {next_url} ({exc})") from exc
+            response.close()
+            raise ScopeError(f"Redirect blocked because target is unsafe or out of scope: {redact_url(next_url)} ({redact_text(exc)})") from exc
+        response.close()
         current_url = next_url
 
     raise ScopeError(f"Too many redirects; stopped after {MAX_REDIRECTS} redirects.")
@@ -177,12 +218,31 @@ def _safe_head(client: httpx.Client, url: str) -> httpx.Response:
     return _safe_request(client, "HEAD", url)
 
 
-def safe_get_text(url: str) -> str:
+def safe_get_text(url: str, *, limit_name: str = "max_javascript_bytes", content_type: str = "JavaScript") -> str:
     """GET text from an in-scope URL using the shared redirect-safety path."""
     with _client() as client:
         response = _safe_get(client, url)
+        try:
+            response.raise_for_status()
+            content = _read_bounded(response, get_limit(limit_name), content_type=content_type)
+            return content.decode(response.encoding or "utf-8", errors="replace")
+        finally:
+            response.close()
+
+
+def safe_get_bytes(url: str, maximum: int, *, content_type: str) -> tuple[bytes, httpx.Response]:
+    """Stream one safe in-scope response into a bounded byte string."""
+    client = _client()
+    try:
+        response = _safe_get(client, url)
         response.raise_for_status()
-        return response.text
+        content = _read_bounded(response, maximum, content_type=content_type)
+        response.close()
+        client.close()
+        return content, response
+    except Exception:
+        client.close()
+        raise
 
 
 def fetch_headers(url: str) -> dict:
@@ -228,10 +288,10 @@ def fetch_headers(url: str) -> dict:
             notes.append("Set-Cookie observed without all common flags; manual review recommended.")
             break
 
-    return {
+    result = {
         "ok": True,
-        "url": url,
-        "final_url": str(response.url),
+        "url": redact_url(url),
+        "final_url": redact_url(response.url),
         "status_code": response.status_code,
         "method": method_used,
         "headers": headers,
@@ -239,6 +299,8 @@ def fetch_headers(url: str) -> dict:
         "notes": notes,
         "fallback_reason": fallback_reason,
     }
+    response.close()
+    return result
 
 
 def fetch_robots(url: str) -> dict:
@@ -246,30 +308,38 @@ def fetch_robots(url: str) -> dict:
     try:
         assert_in_scope(url)
         robots_url = urljoin(f"{_origin_url(url)}/", "robots.txt")
-        with _client() as client:
-            response = _safe_get(client, robots_url)
+        content, response = safe_get_bytes(robots_url, get_limit("max_robots_bytes"), content_type="robots.txt")
     except ScopeError as exc:
         return _error_result(url, str(exc))
     except httpx.HTTPError as exc:
         return _error_result(url, f"HTTP request failed: {exc}")
+    except BoundedReadError as exc:
+        return exc.as_result(robots_url)
 
-    robots_text, content_truncated = _truncate_response_text(response, MAX_ROBOTS_BYTES)
+    robots_text = content.decode(response.encoding or "utf-8", errors="replace")
+    content_truncated = False
 
     disallow = []
     allow = []
+    entry_limit = get_limit("max_analysis_signals")
+    result_truncated = False
     for line in robots_text.splitlines():
         if match := re.match(r"^\s*Disallow\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
             disallow.append(match.group(1))
         elif match := re.match(r"^\s*Allow\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
             allow.append(match.group(1))
+        if len(disallow) + len(allow) >= entry_limit:
+            result_truncated = True
+            break
 
     return {
         "ok": True,
         "url": robots_url,
-        "final_url": str(response.url),
+        "final_url": redact_url(response.url),
         "status_code": response.status_code,
         "content_preview": robots_text[:2000],
         "content_truncated": content_truncated,
+        "results_truncated": result_truncated,
         "disallow": disallow,
         "allow": allow,
     }
@@ -280,14 +350,16 @@ def fetch_sitemap(url: str) -> dict:
     try:
         assert_in_scope(url)
         sitemap_url = urljoin(f"{_origin_url(url)}/", "sitemap.xml")
-        with _client() as client:
-            response = _safe_get(client, sitemap_url)
+        content, response = safe_get_bytes(sitemap_url, get_limit("max_sitemap_bytes"), content_type="sitemap")
     except ScopeError as exc:
         return _error_result(url, str(exc))
     except httpx.HTTPError as exc:
         return _error_result(url, f"HTTP request failed: {exc}")
+    except BoundedReadError as exc:
+        return exc.as_result(sitemap_url)
 
-    sitemap_text, content_truncated = _truncate_response_text(response, MAX_SITEMAP_BYTES)
+    sitemap_text = content.decode(response.encoding or "utf-8", errors="replace")
+    content_truncated = False
 
     discovered_urls = []
     parse_error = None
@@ -296,20 +368,24 @@ def fetch_sitemap(url: str) -> dict:
     elif sitemap_text.strip():
         try:
             root = ET.fromstring(sitemap_text)
+            result_limit = get_limit("max_endpoint_candidates")
             for element in root.iter():
                 if element.tag.endswith("loc") and element.text:
                     discovered_urls.append(element.text.strip())
+                    if len(discovered_urls) >= result_limit:
+                        break
         except (ET.ParseError, DefusedXmlException) as exc:
             parse_error = f"Sitemap XML could not be parsed: {exc}"
 
     return {
         "ok": True,
         "url": sitemap_url,
-        "final_url": str(response.url),
+        "final_url": redact_url(response.url),
         "status_code": response.status_code,
         "discovered_urls": sorted(set(discovered_urls)),
         "count": len(set(discovered_urls)),
         "content_preview": sitemap_text[:2000],
         "content_truncated": content_truncated,
+        "results_truncated": len(discovered_urls) >= get_limit("max_endpoint_candidates"),
         "parse_error": parse_error,
     }

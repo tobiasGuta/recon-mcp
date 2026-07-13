@@ -7,6 +7,8 @@ from pathlib import Path
 
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign_paths, iso_now
+from recon.redaction import redact_structure
+from recon.safeio import SafeIOError, read_bytes_bounded
 
 
 def record_negative_result(
@@ -24,11 +26,11 @@ def record_negative_result(
     record = {
         "timestamp": iso_now(),
         "campaign_id": campaign_id,
-        "target": target,
+        "target": redact_structure(target),
         "check_type": check_type,
-        "result": result,
+        "result": redact_structure(result),
         "repeat_after": repeat_after,
-        "metadata": metadata or {},
+        "metadata": redact_structure(metadata or {}),
     }
     path = Path(paths["paths"]["negative_results_jsonl"])
     try:
@@ -50,12 +52,15 @@ def list_negative_results(campaign_id: str, check_type: str | None = None) -> di
     records = []
     if path.exists():
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
+            text = read_bytes_bounded(path, 20 * 1024 * 1024).decode("utf-8", errors="replace")
+            for line in text.splitlines():
                 if not line.strip():
                     continue
                 record = json.loads(line)
                 if check_type is None or record.get("check_type") == check_type:
                     records.append(record)
-        except (OSError, json.JSONDecodeError) as exc:
+                    if len(records) >= 5000:
+                        break
+        except (OSError, json.JSONDecodeError, SafeIOError) as exc:
             return {"ok": False, "error": f"Could not read negative results: {exc}"}
     return {"ok": True, "results": records, "count": len(records)}

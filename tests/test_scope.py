@@ -22,10 +22,20 @@ def test_exact_domain_match():
     assert result["matched_scope"] == "example.com"
 
 
-def test_subdomain_match():
+def test_child_of_legacy_exact_domain_is_not_implicitly_authorized():
     result = check_scope("api.example.com")
-    assert result["in_scope"] is True
-    assert result["matched_scope"] == "example.com"
+    assert result["in_scope"] is False
+    assert result["reason_code"] == "no_matching_asset"
+
+
+def test_explicit_wildcard_matches_children_but_not_apex(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_assets": [{"value": "*.example.com", "match": "wildcard"}], "allowed_domains": [], "blocked_domains": []},
+    )
+    assert check_scope("api.example.com")["reason_code"] == "wildcard_scope_match"
+    assert check_scope("deep.api.example.com")["in_scope"] is True
+    assert check_scope("example.com")["in_scope"] is False
 
 
 def test_out_of_scope_domain():
@@ -78,7 +88,7 @@ def test_empty_manual_scope_fails_closed(monkeypatch):
 
 def test_url_input_normalization():
     assert normalize_domain("https://API.Example.com:443/path?q=1") == "api.example.com"
-    result = check_scope("https://API.Example.com:443/path?q=1")
+    result = check_scope("https://Example.com:443/path?q=1")
     assert result["in_scope"] is True
 
 
@@ -88,3 +98,38 @@ def test_normalize_domain_authority_header_format():
 
 def test_normalize_domain_host_header_format():
     assert normalize_domain("host:api.example.com") == "api.example.com"
+
+
+def test_manual_scope_normalizes_case_trailing_dot_and_idn(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_assets": [{"value": "BÜCHER.Example.", "match": "exact"}], "allowed_domains": [], "blocked_domains": []},
+    )
+
+    result = check_scope("https://bücher.example./path")
+
+    assert result["in_scope"] is True
+    assert result["normalized_host"] == "xn--bcher-kva.example"
+    assert result["reason_code"] == "exact_scope_match"
+
+
+def test_manual_scope_supports_public_ipv4_and_ipv6_exact_assets(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_assets": [{"value": "8.8.8.8", "match": "exact"}, {"value": "2001:4860:4860::8888", "match": "exact"}], "allowed_domains": [], "blocked_domains": []},
+    )
+
+    assert check_scope("8.8.8.8")["in_scope"] is True
+    assert check_scope("https://[2001:4860:4860::8888]/")["in_scope"] is True
+
+
+def test_malformed_manual_asset_is_not_authorized(monkeypatch):
+    monkeypatch.setattr(
+        "recon.scope.load_scope",
+        lambda: {"scope_source": "manual", "allowed_assets": [{"value": "bad host", "match": "exact"}], "allowed_domains": [], "blocked_domains": []},
+    )
+
+    result = check_scope("bad host")
+
+    assert result["in_scope"] is False
+    assert result["reason_code"] == "unsupported_asset"

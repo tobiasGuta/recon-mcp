@@ -169,7 +169,7 @@ def test_fetch_headers_blocks_out_of_scope_redirect_during_get_fallback(monkeypa
     assert requested == [("HEAD", "https://example.com/"), ("GET", "https://example.com/")]
 
 
-def test_fetch_robots_truncates_large_body(monkeypatch):
+def test_fetch_robots_rejects_large_stream(monkeypatch):
     large_body = b"Disallow: /private\n" + (b"A" * (MAX_ROBOTS_BYTES + 1))
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -188,10 +188,11 @@ def test_fetch_robots_truncates_large_body(monkeypatch):
 
     result = fetch_robots("https://example.com/")
 
-    assert result["ok"] is True
-    assert result["content_truncated"] is True
-    assert len(result["content_preview"]) <= 2000
-    assert result["disallow"] == ["/private"]
+    assert result["ok"] is False
+    assert result["truncated"] is True
+    assert result["error_code"] == "response_too_large"
+    assert result["configured_maximum_bytes"] == MAX_ROBOTS_BYTES
+    assert result["rejected"] is True
 
 
 def test_fetch_sitemap_rejects_oversized_body(monkeypatch):
@@ -213,10 +214,10 @@ def test_fetch_sitemap_rejects_oversized_body(monkeypatch):
 
     result = fetch_sitemap("https://example.com/")
 
-    assert result["ok"] is True
-    assert result["content_truncated"] is True
-    assert result["parse_error"] == "Response too large to parse."
-    assert result["discovered_urls"] == []
+    assert result["ok"] is False
+    assert result["truncated"] is True
+    assert result["error_code"] == "response_too_large"
+    assert result["configured_maximum_bytes"] == MAX_SITEMAP_BYTES
 
 
 def test_fetch_robots_out_of_scope_url_is_rejected(monkeypatch):
@@ -446,3 +447,45 @@ def test_fetch_sitemap_handles_defusedxml_exception_safely(monkeypatch):
     assert result["ok"] is True
     assert result["discovered_urls"] == []
     assert "blocked by test" in result["parse_error"]
+
+
+def test_streamed_limit_stops_before_later_chunks(monkeypatch):
+    observed = []
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            observed.append(1)
+            yield b"A" * 600
+            observed.append(2)
+            yield b"B" * 600
+            raise AssertionError("bounded reader should stop before requesting a later chunk")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Stream())
+
+    patch_scope(monkeypatch, max_robots_bytes=1024)
+    monkeypatch.setattr("recon.http_fetch._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    result = fetch_robots("https://example.com/")
+
+    assert result["ok"] is False
+    assert result["bytes_observed"] == 1200
+    assert observed == [1, 2]
+
+
+def test_sensitive_query_url_is_rejected_without_request(monkeypatch):
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200)
+
+    patch_scope(monkeypatch)
+    monkeypatch.setattr("recon.http_fetch._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    result = fetch_headers("https://example.com/?token=do-not-send")
+
+    assert result["ok"] is False
+    assert "sensitive query" in result["error"].lower()
+    assert "do-not-send" not in str(result)
+    assert requested == []

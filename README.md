@@ -44,12 +44,15 @@ Recommended campaign flow:
 4. `fetch_sitemap_for_campaign`
 5. `collect_js_urls_for_campaign`
 6. `extract_endpoints_for_campaign`
-7. `score_endpoints`
-8. `create_finding_candidate`
-9. `promote_finding` only after manual validation
-10. `create_campaign_evidence_note`
-11. `generate_campaign_summary`
-12. `generate_report_candidate_markdown`
+7. `scan_sensitive_artifacts_for_campaign` and `extract_api_contracts_for_campaign`
+8. `get_evidence_graph_summary` and a bounded `query_evidence_graph` when useful
+9. Optionally run passive subdomain discovery; DNS resolution remains off by default
+10. `score_endpoints`
+11. `create_finding_candidate`
+12. `promote_finding` only after manual validation
+13. `create_campaign_evidence_note`
+14. `generate_campaign_summary` and `verify_campaign_artifacts`
+15. `generate_report_candidate_markdown`
 
 `generate_campaign_summary` writes `reports/summary.md`, and `generate_manual_test_plan_for_campaign` writes `reports/manual_test_plan.md`. Reports are local Markdown files only; nothing is auto-submitted anywhere.
 
@@ -106,6 +109,30 @@ Source map workflow:
 9. `promote_finding` only after impact is proven
 10. `generate_campaign_summary`
 
+## Deterministic local analysis
+
+The architecture keeps one safety path instead of parallel subsystems: `scope.py` owns authorization, `http_fetch.py` owns streamed target requests and redirect/DNS checks, `safeio.py` owns campaign path and artifact boundaries, `audit.py` owns append-only operation history, and the existing campaign/finding/report workflow remains the only promotion path. Feature modules contribute redacted structured artifacts and evidence-graph observations through those shared layers.
+
+`scan_sensitive_artifacts_for_campaign` analyzes only approved campaign-local text. It returns minimal prefix/suffix redactions and SHA-256 fingerprints; complete candidates and surrounding source lines are never returned, persisted, logged, or placed in reports. Private-key candidates expose only their type/header, location, and fingerprint. Placeholder values are downgraded, and public client identifiers such as Stripe publishable keys, Sentry DSNs, Firebase configuration, and Google browser API keys are separate client-configuration signals. The tool never tests a credential.
+
+`extract_api_contracts_for_campaign` recognizes deterministic `fetch`, Axios, Angular `HttpClient`, `XMLHttpRequest`, WebSocket, JSON body, and named GraphQL operation patterns. Every contract declares endpoint uncertainty as `static`, `partially_dynamic`, `fully_dynamic`, or `unknown`. Its previews redact authentication-like values. Contract priority is only a manual-review order, never a vulnerability conclusion.
+
+## Evidence, passive discovery, and comparison
+
+The campaign evidence graph records normalized, redacted nodes, edges, provenance, confidence, scope decisions, and observation history. Graph summaries and neighborhood queries are bounded; the entire graph is not returned by default. `import_dirfuzz_evidence_for_campaign` adapts analysis already saved by the existing DirFuzz handoff. The stable version 1.0 schema is documented in [Security Design](docs/security-design.md).
+
+Passive discovery queries fixed public provider APIs, so it does make external requests and reveals the authorized root domain to those providers. It does not contact discovered subdomains. Exact apex authorization permits recording children only as out-of-scope leads; wildcard authorization is required before children become testable. Optional DNS resolution is explicit, bounded, and never followed by HTTP probing.
+
+`compare_campaign_recon` compares normalized artifacts rather than timestamps or generated filenames. It produces structured JSON and Markdown for added, removed, or changed recon observations, using only detector IDs and fingerprints for secret candidates. Differences remain recon leads.
+
+## Traffic import and artifact integrity
+
+HAR and Burp XML imports accept only campaign-local files (prefer `imports/`) and never replay requests. They retain host, path, method, status, content type, parameter names, body-field names, authentication presence, cookie names, and scope decisions. Authorization values, cookies, sensitive query values, session data, and bodies are not stored. Burp XML uses hardened XML parsing.
+
+New structured artifacts carry provenance and have sibling integrity metadata whose SHA-256 is calculated from final saved bytes. `verify_campaign_artifacts` is read-only and reports verified, missing, modified, malformed, and unsupported legacy artifacts.
+
+Nuclei is intentionally not executed here. A future separate Nuclei MCP must use exact reviewed template IDs, pinned signed HTTP-only templates, strict one-target plans and limits, explicit approval, and structured result import. Tags are never the main safety boundary. `nuclei_integration_info` returns the non-executing contract.
+
 ## Installation
 
 Use Python 3.11 or newer.
@@ -126,9 +153,11 @@ Create a local `config/scope.json` from `config/scope.example.json`, then edit i
   "h1_snapshot_dir": "",
   "include_only_bounty_eligible": false,
   "include_only_submission_eligible": true,
-  "allowed_domains": [
-    "example.com"
+  "allowed_assets": [
+    {"value": "api.example.com", "match": "exact"},
+    {"value": "*.example.com", "match": "wildcard"}
   ],
+  "allowed_domains": [],
   "user_agent": "ReconMCP/0.1",
   "request_delay_ms": 500,
   "max_requests_per_tool_call": 20,
@@ -144,7 +173,7 @@ Create a local `config/scope.json` from `config/scope.example.json`, then edit i
 
 Set `scope_source` to `h1_snapshots` to load local H1-Scope-Watcher JSON files for scope checks. Scope config is cached briefly, and new snapshots are picked up without restarting the MCP server. Set `scope_source` to `manual` to use `allowed_domains` instead.
 
-Exact domains and subdomains are allowed. For example, `api.example.com` matches `example.com`. H1 wildcard entries like `*.example.com` are normalized into host rules. Localhost, loopback, private IPs, link-local IPs, and blocked domains are rejected. If H1 snapshots are missing or invalid, scope checks fail closed.
+Exact assets authorize only the normalized host. Wildcard assets authorize child and deeply nested subdomains but exclude the apex. Legacy plain `allowed_domains` entries now migrate as exact assets; only an explicit `*.example.com` legacy entry is a wildcard. This safer behavior intentionally replaces the former implicit-subdomain authorization. H1 wildcard entries remain normalized into host rules. IDNs are normalized, while malformed assets and unsafe IPs fail closed.
 
 Request hygiene settings:
 
@@ -153,6 +182,8 @@ Request hygiene settings:
 - `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
 - `check_scope_batch` accepts up to 200 hosts or URLs per call.
 - `fetch_headers_method` defaults to `HEAD`. If `HEAD` is blocked or fails before useful headers are available, `fetch_headers` falls back to a safe `GET` that requests only the first byte and still checks scope before every redirect hop.
+- `max_html_bytes`, `max_javascript_bytes`, `max_sourcemap_bytes`, `max_sitemap_bytes`, and `max_robots_bytes` stop streamed reads as soon as a limit is exceeded.
+- `max_saved_artifact_bytes`, `max_extracted_source_files`, `max_total_extracted_source_bytes`, `max_analysis_signals`, and `max_endpoint_candidates` bound local artifacts and analysis output. Invalid or unreasonable integer values reject the configuration.
 
 ## H1-Scope-Watcher Snapshots
 
@@ -174,34 +205,137 @@ D:/Tools/H1-Scope-Watcher/snapshots/program_handle.json
 
 Point `h1_snapshot_dir` at that folder. Do not point Recon MCP at H1-Scope-Watcher `config.yaml`, `.env`, or any file containing API tokens.
 
-## Run the MCP Server
+## Use Recon MCP from a CLI or MCP Client
+
+Recon MCP is a local **stdio** server. Normally, your CLI or desktop client starts
+`server.py` for you and communicates with it over standard input/output. Use
+absolute paths so the client starts the intended Python environment even when the
+virtual environment is not activated in that client's shell.
+
+Before connecting a client, complete the installation steps above and create your
+authorized `config/scope.json`.
+
+### Codex CLI
+
+Add Recon MCP to Codex on Windows PowerShell:
 
 ```powershell
-python .\server.py
+codex mcp add recon -- D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
 ```
 
-The server runs over stdio:
+On macOS or Linux, replace both paths with absolute paths on your machine:
 
-```python
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
+```bash
+codex mcp add recon -- /absolute/path/recon-mcp/.venv/bin/python /absolute/path/recon-mcp/server.py
 ```
 
-## Codex MCP Config Example
+Check that Codex saved the server correctly:
 
-Replace paths with your real local paths.
+```powershell
+codex mcp list
+codex mcp get recon
+```
+
+Start an interactive Codex session in the repository, then use `/mcp` to inspect
+the connected server:
+
+```powershell
+codex -C D:/Tools/recon-mcp
+```
+
+A safe first prompt is:
+
+```text
+Use the recon health and list_loaded_scope tools. Do not make network requests.
+```
+
+You can also run a one-shot Codex command:
+
+```powershell
+codex -C D:/Tools/recon-mcp "Use the recon health tool and summarize the server status."
+```
+
+To replace or remove this registration:
+
+```powershell
+codex mcp remove recon
+codex mcp add recon -- D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
+```
+
+Run `codex mcp --help` for the commands supported by your installed Codex version.
+See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/)
+for current CLI, IDE extension, and desktop-app instructions.
+
+### Codex `config.toml`
+
+As an alternative to `codex mcp add`, add the server directly to
+`~/.codex/config.toml` (on Windows, usually
+`%USERPROFILE%\.codex\config.toml`) or to a trusted project's
+`.codex/config.toml`:
 
 ```toml
 [mcp_servers.recon]
-command = "python"
+command = "D:/Tools/recon-mcp/.venv/Scripts/python.exe"
 args = ["D:/Tools/recon-mcp/server.py"]
 ```
+
+Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share this MCP
+configuration. In the graphical clients, you can instead add an MCP server in
+Settings, choose **STDIO**, and enter the same command and argument.
+
+### Other stdio MCP clients
+
+Clients that use JSON configuration commonly accept a structure like this. The
+configuration filename and settings screen vary by client, so check that client's
+documentation.
+
+```json
+{
+  "mcpServers": {
+    "recon": {
+      "command": "D:/Tools/recon-mcp/.venv/Scripts/python.exe",
+      "args": ["D:/Tools/recon-mcp/server.py"]
+    }
+  }
+}
+```
+
+If a CLI accepts a server command after `--`, the equivalent command portion is:
+
+```text
+D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
+```
+
+Select local stdio transport, not HTTP or SSE. This repository does not expose a
+remote MCP URL.
+
+### Manual launch and troubleshooting
+
+You can launch the server directly as a diagnostic:
+
+```powershell
+D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
+```
+
+A blank terminal that appears to wait is expected: the process is waiting for MCP
+JSON-RPC messages on stdin. Press `Ctrl+C` to stop it. It is not a standalone chat
+CLI.
+
+If the client cannot connect:
+
+- Confirm the Python and `server.py` paths are absolute and exist.
+- Run `codex mcp get recon` or inspect the equivalent client configuration.
+- Launch the command manually and check for import or configuration errors.
+- Confirm `config/scope.json` is valid; invalid or unsafe scope fails closed.
+- Do not put API tokens or bug-bounty platform credentials in MCP arguments.
+
+### Run alongside DirFuzz MCP
 
 You can run this alongside your Go DirFuzz MCP server:
 
 ```toml
 [mcp_servers.recon]
-command = "python"
+command = "D:/Tools/recon-mcp/.venv/Scripts/python.exe"
 args = ["D:/Tools/recon-mcp/server.py"]
 
 [mcp_servers.dirfuzz]
@@ -268,6 +402,17 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
 - `sourcemap_workflow_for_campaign(campaign_id: str, js_url: str)`
 - `external_sourcemapper_info()`
+- `scan_sensitive_artifacts_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
+- `extract_api_contracts_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
+- `get_evidence_graph_summary(campaign_id: str)`
+- `query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit: int = 100)`
+- `import_dirfuzz_evidence_for_campaign(campaign_id: str, analysis_path: str | None = None)`
+- `discover_subdomains_passive_for_campaign(campaign_id: str, root_domain: str, providers: list[str] | None = None, max_results: int = 500, resolve_dns: bool = False)`
+- `compare_campaign_recon(campaign_id: str, baseline_campaign_id: str)`
+- `import_har_for_campaign(campaign_id: str, har_path: str)`
+- `import_burp_xml_for_campaign(campaign_id: str, xml_path: str)`
+- `verify_campaign_artifacts(campaign_id: str)`
+- `nuclei_integration_info()`
 
 ## Legacy Example Workflow
 

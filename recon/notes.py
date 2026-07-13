@@ -9,6 +9,8 @@ from pathlib import Path
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign_paths
 from recon.findings import update_finding_gates
+from recon.redaction import redact_structure
+from recon.safeio import SafeIOError, atomic_write_bytes, limit, write_artifact_bytes
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -23,6 +25,7 @@ def _slug(value: str) -> str:
 
 def _list_or_text(value: object) -> str:
     """Render lists and plain values as Markdown."""
+    value = redact_structure(value)
     if isinstance(value, list):
         return "\n".join(f"- {item}" for item in value) if value else "None provided."
     if isinstance(value, dict):
@@ -32,6 +35,7 @@ def _list_or_text(value: object) -> str:
 
 def create_evidence_note(finding: dict) -> dict:
     """Write a Markdown evidence note for a manually reviewed finding."""
+    finding = redact_structure(finding)
     if EVIDENCE_DIR.is_symlink():
         return {"ok": False, "error": "EVIDENCE_DIR must not be a symlink."}
 
@@ -82,8 +86,8 @@ def create_evidence_note(finding: dict) -> dict:
 """
 
     try:
-        path.write_text(content, encoding="utf-8")
-    except OSError as exc:
+        atomic_write_bytes(path, content.encode("utf-8"), maximum=limit("max_saved_artifact_bytes"))
+    except (OSError, SafeIOError) as exc:
         return {"ok": False, "error": f"Could not write evidence note: {exc}"}
 
     return {"ok": True, "path": str(path), "title": title}
@@ -93,6 +97,7 @@ def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
     """Write a campaign evidence note for authorized manual validation only."""
     if not isinstance(finding, dict):
         return {"ok": False, "error": "finding must be a dictionary."}
+    finding = redact_structure(finding)
     paths = get_campaign_paths(campaign_id)
     if not paths.get("ok"):
         return {"ok": False, "error": paths.get("error", "Could not load campaign paths.")}
@@ -143,8 +148,8 @@ def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
 {_list_or_text(finding.get("notes"))}
 """
     try:
-        path.write_text(content, encoding="utf-8")
-    except OSError as exc:
+        saved = write_artifact_bytes(campaign_id, "create_campaign_evidence_note", path, content.encode("utf-8"), maximum=limit("max_saved_artifact_bytes"), limits_applied={"max_saved_artifact_bytes": limit("max_saved_artifact_bytes")})
+    except (OSError, SafeIOError) as exc:
         return {"ok": False, "error": f"Could not write campaign evidence note: {exc}"}
 
     gate_result = None
@@ -170,4 +175,4 @@ def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
         warnings.append(f"Finding gate was not updated: {gate_result.get('error')}")
     if not audit.get("ok"):
         warnings.extend(audit.get("warnings", []))
-    return {"ok": True, "path": str(path), "title": title, "gate_update": gate_result, "warnings": warnings}
+    return {"ok": True, "path": str(path), "metadata_path": saved["metadata_path"], "artifact_uuid": saved["artifact_uuid"], "title": title, "gate_update": gate_result, "warnings": warnings}
