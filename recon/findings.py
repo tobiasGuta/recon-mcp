@@ -54,7 +54,7 @@ DEFAULT_GATES = {
     "evidence_saved": False,
     "reproduced_manually": False,
     "impact_proven": False,
-    "safe_non_destructive": True,
+    "safe_non_destructive": False,
     "report_ready": False,
 }
 
@@ -137,7 +137,8 @@ def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
     path = _finding_file(campaign_id, HALLUCINATION, finding_id)
     if path is None:
         return _error("Could not resolve finding path.")
-    if path.exists():
+    existing, _, _ = _find_existing_file(campaign_id, finding_id)
+    if existing is not None or path.exists():
         return _error("Finding already exists.")
 
     now = iso_now()
@@ -155,7 +156,7 @@ def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
         "impact_hypothesis": finding.get("impact_hypothesis") or finding.get("impact") or "",
         "impact_proven": False,
         "safe_test_only": True,
-        "promotion_gates": {**DEFAULT_GATES, **(finding.get("promotion_gates") or {})},
+        "promotion_gates": dict(DEFAULT_GATES),
         "created_at": now,
         "updated_at": now,
         "history": [_history_entry("create", None, HALLUCINATION, "Candidate starts in hallucinations.")],
@@ -231,8 +232,12 @@ def _transition(
         return _error(f"Could not read finding: {exc}")
 
     gates = {**DEFAULT_GATES, **(finding.get("promotion_gates") or {})}
-    if gate_updates:
-        gates.update({key: bool(value) for key, value in gate_updates.items() if key in DEFAULT_GATES})
+    if gate_updates is not None:
+        if not isinstance(gate_updates, dict) or any(key not in DEFAULT_GATES or type(value) is not bool for key, value in gate_updates.items()):
+            return _error("Gate updates must use known names and literal boolean values.")
+        gates.update(gate_updates)
+    if action == "demote":
+        gates = dict(DEFAULT_GATES)
     if target_status == REPORT_CANDIDATE and not all(gates.get(gate) is True for gate in REPORT_GATES):
         return _error("Report candidate status requires all promotion gates to be true.")
 
@@ -288,7 +293,9 @@ def update_finding_gates(campaign_id: str, finding_id: str, gate_updates: dict, 
     except (OSError, json.JSONDecodeError, SafeIOError) as exc:
         return _error(f"Could not read finding: {exc}")
     gates = {**DEFAULT_GATES, **(finding.get("promotion_gates") or {})}
-    gates.update({key: bool(value) for key, value in gate_updates.items() if key in DEFAULT_GATES})
+    if not isinstance(gate_updates, dict) or any(key not in DEFAULT_GATES or type(value) is not bool for key, value in gate_updates.items()):
+        return _error("Gate updates must use known names and literal boolean values.")
+    gates.update(gate_updates)
     finding["promotion_gates"] = gates
     finding["updated_at"] = iso_now()
     finding.setdefault("history", []).append(_history_entry("gate_update", current_status, current_status, reason, gate_updates))

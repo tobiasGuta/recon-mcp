@@ -23,7 +23,6 @@ from recon.findings import create_finding_candidate as create_finding_candidate_
 from recon.findings import demote_finding as demote_finding_logic
 from recon.findings import get_finding as get_finding_logic
 from recon.findings import list_findings as list_findings_logic
-from recon.findings import promote_finding as promote_finding_logic
 from recon.findings import reject_finding as reject_finding_logic
 from recon.http_fetch import fetch_headers as fetch_headers_logic
 from recon.http_fetch import fetch_robots as fetch_robots_logic
@@ -98,7 +97,6 @@ AVAILABLE_TOOLS = [
     "create_finding_candidate",
     "get_finding",
     "list_findings",
-    "promote_finding",
     "demote_finding",
     "reject_finding",
     "create_campaign_evidence_note",
@@ -148,6 +146,7 @@ def health() -> dict:
         "version": __version__,
         "available_tools": AVAILABLE_TOOLS,
         "safety_note": "This server provides scoped, low-risk recon helpers only.",
+        "review_note": "Upward finding transitions require the separate local review CLI; never run it through an AI shell.",
         "dirfuzz_note": "Directory fuzzing is delegated to the separate Go DirFuzz MCP server.",
         "nuclei_note": "Nuclei execution is intentionally outside this MCP trust boundary.",
         "processing_limits": {name: int(config.get(name, default)) for name, default in DEFAULT_LIMITS.items()},
@@ -367,12 +366,6 @@ def get_finding(campaign_id: str, finding_id: str) -> dict:
 def list_findings(campaign_id: str, status: str | None = None) -> dict:
     """List finding candidates for authorized, human-led testing only."""
     return list_findings_logic(campaign_id, status=status)
-
-
-@mcp.tool()
-def promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None) -> dict:
-    """Promote a finding after human validation for authorized, human-led testing only."""
-    return promote_finding_logic(campaign_id, finding_id, target_status, reason, gate_updates=gate_updates)
 
 
 @mcp.tool()

@@ -96,3 +96,38 @@ def test_finding_path_traversal_is_blocked(campaign_env):
 
     assert result["ok"] is False
     assert "unsafe" in result["error"].lower()
+
+
+def test_candidate_cannot_supply_approval_gates(campaign_env):
+    from recon.findings import REPORT_GATES
+    campaign_id = _campaign(campaign_env)
+    finding = create_finding_candidate(campaign_id, {
+        "title": "Unverified lead",
+        "promotion_gates": dict.fromkeys(REPORT_GATES, True),
+    })["finding"]
+    assert not any(finding["promotion_gates"].values())
+
+
+def test_string_gate_values_are_rejected(campaign_env):
+    campaign_id = _campaign(campaign_env)
+    finding = create_finding_candidate(campaign_id, {"title": "Unverified lead"})["finding"]
+    result = promote_finding(campaign_id, finding["finding_id"], NEEDS_MANUAL_VALIDATION,
+                             "test", {"scope_confirmed": "false"})
+    assert result["ok"] is False
+    assert get_finding(campaign_id, finding["finding_id"])["finding"]["status"] == HALLUCINATION
+
+
+def test_mcp_does_not_expose_upward_promotion():
+    import ast
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8"))
+    exposed = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+               and any(isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                       and d.func.attr == "tool" for d in node.decorator_list)}
+    assert "promote_finding" not in exposed
+    assert "update_finding_gates" not in exposed
+
+
+def test_review_cli_rejects_noninteractive_input(monkeypatch):
+    from recon import review
+    monkeypatch.setattr(review.sys.stdin, "isatty", lambda: False)
+    assert review.main(["campaign", "finding"]) == 2

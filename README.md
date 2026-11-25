@@ -49,7 +49,7 @@ Recommended campaign flow:
 9. Optionally run passive subdomain discovery; DNS resolution remains off by default
 10. `score_endpoints`
 11. `create_finding_candidate`
-12. `promote_finding` only after manual validation
+12. Review and promote findings from a trusted human-operated terminal (see below)
 13. `create_campaign_evidence_note`
 14. `generate_campaign_summary` and `verify_campaign_artifacts`
 15. `generate_report_candidate_markdown`
@@ -74,6 +74,14 @@ Allowed status flow:
 - any status to `rejected`
 
 Report candidates require all gates to be true: scope confirmed, evidence saved, reproduced manually, impact proven, safe non-destructive testing, and report ready. The pipeline blocks direct jumps from hallucination to validated or report candidate.
+
+Upward transitions are no longer exposed as MCP tools. From the repository root, in a trusted human-operated terminal, run:
+
+```sh
+python -m recon.review CAMPAIGN_ID FINDING_ID
+```
+
+The reviewer must inspect evidence independently, attest to each required gate and explicitly approve each transition. Candidate-supplied gates are ignored. Demotion clears existing gates. Do not grant an AI shell or filesystem write access to this review environment if you need an independent approval boundary; a TTY alone is not proof of human identity. Existing findings created before this change should be independently reviewed again before reporting.
 
 Negative-result memory is stored in `memory/negative_results.jsonl`. These records document useful checks that did not produce findings; they are included in summaries and manual plans, but they are not treated as vulnerabilities.
 
@@ -106,7 +114,7 @@ Source map workflow:
 6. `analyze_sourcemap_sources_for_campaign`
 7. `generate_manual_test_plan_for_campaign`
 8. `create_finding_candidate` only if manual validation suggests a real issue
-9. `promote_finding` only after impact is proven
+9. Use the local review CLI only after impact is proven
 10. `generate_campaign_summary`
 
 ## Deterministic local analysis
@@ -181,6 +189,7 @@ Request hygiene settings:
 - `request_delay_ms` adds a small delay before network requests. The default is `500`.
 - `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
 - `check_scope_batch` accepts up to 200 hosts or URLs per call.
+- Response header values are suppressed unless they are selected security or basic diagnostic headers; cookie values and arbitrary custom header values are never returned by the header helper. Selected values receive best-effort token redaction. Environment proxy settings are disabled for target HTTP requests.
 - `fetch_headers_method` defaults to `HEAD`. If `HEAD` is blocked or fails before useful headers are available, `fetch_headers` falls back to a safe `GET` that requests only the first byte and still checks scope before every redirect hop.
 - `max_html_bytes`, `max_javascript_bytes`, `max_sourcemap_bytes`, `max_sitemap_bytes`, and `max_robots_bytes` stop streamed reads as soon as a limit is exceeded.
 - `max_saved_artifact_bytes`, `max_extracted_source_files`, `max_total_extracted_source_bytes`, `max_analysis_signals`, and `max_endpoint_candidates` bound local artifacts and analysis output. Invalid or unreasonable integer values reject the configuration.
@@ -385,7 +394,6 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `create_finding_candidate(campaign_id: str, finding: dict)`
 - `get_finding(campaign_id: str, finding_id: str)`
 - `list_findings(campaign_id: str, status: str | None = None)`
-- `promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None)`
 - `demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str)`
 - `reject_finding(campaign_id: str, finding_id: str, reason: str)`
 - `create_campaign_evidence_note(campaign_id: str, finding: dict)`

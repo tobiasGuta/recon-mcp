@@ -489,3 +489,22 @@ def test_sensitive_query_url_is_rejected_without_request(monkeypatch):
     assert "sensitive query" in result["error"].lower()
     assert "do-not-send" not in str(result)
     assert requested == []
+
+
+def test_header_values_are_suppressed_before_return(monkeypatch):
+    patch_scope(monkeypatch)
+    def handler(request):
+        return httpx.Response(200, headers={
+            "Set-Cookie": "id=opaque-cookie-value; Secure; HttpOnly; SameSite=Lax",
+            "X-Custom": "opaque-private-value",
+            "Authorization": "opaque-auth-value",
+            "X-Frame-Options": "DENY",
+        })
+    monkeypatch.setattr("recon.http_fetch._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+    result = fetch_headers("https://example.com/")
+    assert result["ok"]
+    assert result["headers"]["set-cookie"] == "<redacted>"
+    assert result["headers"]["x-custom"] == "<redacted>"
+    assert result["headers"]["authorization"] == "<redacted>"
+    assert result["interesting_headers"]["X-Frame-Options"] == "DENY"
+    assert "opaque-" not in str(result)
