@@ -32,9 +32,15 @@ wheelhouse/
 
 # Local scope configuration and snapshots
 config/scope.json
+config/policies/
+config/private/
 snapshots/
 **/snapshots/
 *.jsonl
+
+# Local MCP client fixtures and private settings
+/.codex/
+/.gemini/
 
 # Generated recon output
 output/*

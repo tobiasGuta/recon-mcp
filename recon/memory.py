@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from recon.campaign_jsonl import append_campaign_record
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign_paths, iso_now
 from recon.redaction import redact_structure
 from recon.safeio import SafeIOError, read_bytes_bounded
 
 
+@campaign_operation
 def record_negative_result(
     campaign_id: str,
     target: str,
@@ -34,15 +37,15 @@ def record_negative_result(
     }
     path = Path(paths["paths"]["negative_results_jsonl"])
     try:
-        with path.open("a", encoding="utf-8") as memory_file:
-            memory_file.write(json.dumps(record, sort_keys=True) + "\n")
-    except OSError as exc:
+        append_campaign_record(path, record)
+    except (OSError, ValueError) as exc:
         return {"ok": False, "error": f"Could not write negative result: {exc}"}
     audit = write_audit_event(campaign_id, "record_negative_result", target=target, ok=True, result_path=str(path))
     warnings = audit.get("warnings", []) if not audit.get("ok") else []
     return {"ok": True, "record": record, "path": str(path), "warnings": warnings}
 
 
+@campaign_operation
 def list_negative_results(campaign_id: str, check_type: str | None = None) -> dict:
     """List campaign negative-result memory entries."""
     paths = get_campaign_paths(campaign_id)
@@ -53,7 +56,7 @@ def list_negative_results(campaign_id: str, check_type: str | None = None) -> di
     if path.exists():
         try:
             text = read_bytes_bounded(path, 20 * 1024 * 1024).decode("utf-8", errors="replace")
-            for line in text.splitlines():
+            for line in text.split("\n")[:-1]:
                 if not line.strip():
                     continue
                 record = json.loads(line)

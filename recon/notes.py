@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign_paths
 from recon.findings import update_finding_gates
@@ -93,6 +94,7 @@ def create_evidence_note(finding: dict) -> dict:
     return {"ok": True, "path": str(path), "title": title}
 
 
+@campaign_operation
 def create_campaign_evidence_note(campaign_id: str, finding: dict) -> dict:
     """Write a campaign evidence note for authorized manual validation only."""
     if not isinstance(finding, dict):

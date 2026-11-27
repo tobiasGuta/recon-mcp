@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths
 from recon.endpoint_scoring import score_endpoint
@@ -130,6 +131,7 @@ def extract_contracts_from_text(text: str, source_file: str = "source.js") -> li
     return list(unique.values())
 
 
+@campaign_operation
 def extract_api_contracts_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
     paths = get_campaign_paths(campaign_id)
     if not paths.get("ok"):

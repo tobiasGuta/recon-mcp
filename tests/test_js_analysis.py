@@ -1,3 +1,4 @@
+from recon.authorization import load_policy
 from recon.js_analysis import collect_js_urls, extract_endpoints_from_js
 
 
@@ -37,7 +38,7 @@ def test_extracting_endpoints_from_raw_source_type():
 
 
 def test_extracting_endpoints_from_url_source_type(monkeypatch):
-    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: 'fetch("/api/from-url");')
+    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: ('fetch("/api/from-url");', url, {}))
 
     result = extract_endpoints_from_js("https://example.com/app.js", source_type="url")
 
@@ -118,8 +119,9 @@ def test_collect_js_urls_truncates_above_max_requests_per_tool_call(monkeypatch)
     <script src="/three.js"></script>
     """
 
-    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: html)
+    monkeypatch.setattr("recon.scope.load_scope", lambda: config)
     monkeypatch.setattr("recon.js_analysis.load_scope", lambda: config)
+    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: (html, url, {"policy_fingerprint": load_policy().fingerprint}))
 
     result = collect_js_urls("https://example.com/")
 
@@ -142,8 +144,9 @@ def test_collect_js_urls_allows_at_exactly_max_limit(monkeypatch):
     <script src="/two.js"></script>
     """
 
-    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: html)
+    monkeypatch.setattr("recon.scope.load_scope", lambda: config)
     monkeypatch.setattr("recon.js_analysis.load_scope", lambda: config)
+    monkeypatch.setattr("recon.js_analysis._fetch_text", lambda url: (html, url, {"policy_fingerprint": load_policy().fingerprint}))
 
     result = collect_js_urls("https://example.com/")
 

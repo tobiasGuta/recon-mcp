@@ -110,7 +110,7 @@ def test_manual_scope_normalizes_case_trailing_dot_and_idn(monkeypatch):
 
     assert result["in_scope"] is True
     assert result["normalized_host"] == "xn--bcher-kva.example"
-    assert result["reason_code"] == "exact_scope_match"
+    assert result["reason_code"] == "allowed"
 
 
 def test_manual_scope_supports_public_ipv4_and_ipv6_exact_assets(monkeypatch):

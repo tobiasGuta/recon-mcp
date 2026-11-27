@@ -91,7 +91,8 @@ def test_archive_campaign_does_not_overwrite_existing_archive(campaign_env):
     created = create_campaign("Demo", "example.com")
     campaign_id = created["campaign_id"]
     archive_dir = campaign_env.parent / "archived_campaigns" / campaign_id
-    archive_dir.mkdir(parents=True)
+    archive_dir.parent.mkdir(mode=0o700)
+    archive_dir.mkdir(mode=0o700)
 
     result = archive_campaign(campaign_id)
 

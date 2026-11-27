@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
-from recon import __version__
+from recon import __version__, authorization
 from recon.campaigns import archive_campaign as archive_campaign_logic
 from recon.campaigns import create_campaign as create_campaign_logic
 from recon.campaigns import delete_archived_campaign as delete_archived_campaign_logic
@@ -66,7 +68,17 @@ from recon.workflow import generate_manual_test_plan_for_campaign as generate_ma
 from recon.workflow import save_dirfuzz_analysis_for_campaign as save_dirfuzz_analysis_for_campaign_logic
 
 
-mcp = FastMCP("recon-mcp")
+class ReconMCP(FastMCP):
+    async def call_tool(self, name, arguments):
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError:
+            # SDK validation errors can contain the submitted value.
+            raise ToolError("Tool input or execution failed. Check the tool schema and arguments.") from None
+
+
+mcp = ReconMCP("recon-mcp")
+OFFLINE_READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 
 AVAILABLE_TOOLS = [
     "health",
@@ -77,6 +89,12 @@ AVAILABLE_TOOLS = [
     "recommend_bugmap_parent",
     "explain_scope_decision",
     "list_loaded_scope",
+    "validate_scope_policy",
+    "check_url_scope",
+    "check_url_scope_batch",
+    "get_scope_policy_summary",
+    "compare_scope_policies",
+    "get_scope_capabilities",
     "fetch_headers",
     "fetch_robots",
     "fetch_sitemap",
@@ -158,7 +176,7 @@ def health() -> dict:
 
 @mcp.tool()
 def check_scope(domain: str) -> dict:
-    """Safely check whether a domain or URL is authorized by configured recon scope."""
+    """Check host inventory or evaluate a complete HTTP(S) URL offline."""
     return check_scope_logic(domain)
 
 
@@ -196,6 +214,42 @@ def explain_scope_decision(host_or_url: str) -> dict:
 def list_loaded_scope() -> dict:
     """Return a safe, non-secret summary of loaded authorized recon scope."""
     return list_loaded_scope_logic()
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def validate_scope_policy() -> dict[str, object]:
+    """Validate the active local policy and report unsupported rules without making requests."""
+    return authorization.validate_scope_policy()
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def check_url_scope(url: str) -> dict[str, object]:
+    """Evaluate a complete HTTP(S) URL offline and return redacted authorization provenance."""
+    return authorization.check_url_scope(url)
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def check_url_scope_batch(urls: list[str]) -> dict[str, object]:
+    """Evaluate up to 100 complete URLs offline against one policy version."""
+    return authorization.check_url_scope_batch(urls)
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def get_scope_policy_summary() -> dict[str, object]:
+    """Summarize the enforceable rules and current policy fingerprint offline."""
+    return authorization.get_scope_policy_summary()
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def compare_scope_policies(before: str, after: str) -> dict[str, object]:
+    """Compare two local configuration names staged under config/policies without activating them."""
+    return authorization.compare_scope_policies(before, after)
+
+
+@mcp.tool(annotations=OFFLINE_READ_ONLY)
+def get_scope_capabilities() -> dict[str, object]:
+    """Describe supported sources, constraints, and offline evaluation limits."""
+    return authorization.get_scope_capabilities()
 
 
 @mcp.tool()
@@ -555,5 +609,14 @@ def nuclei_integration_info() -> dict:
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    import logging
+
+    # HTTPX logs complete request URLs at INFO level, including raw query values.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

@@ -6,15 +6,17 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
+from recon.authorization import safe_target
+from recon.campaign_scope import campaign_network
 from recon.campaigns import file_timestamp, get_campaign, get_campaign_paths, slugify
 from recon.endpoint_scoring import score_endpoints
 from recon.http_fetch import fetch_headers, fetch_robots, fetch_sitemap
-from recon.js_analysis import collect_js_urls, extract_endpoints_from_js
+from recon.js_analysis import collect_js_urls, extract_endpoints_from_js, js_input_type
 from recon.memory import list_negative_results
 from recon.planner import generate_manual_test_plan
 from recon.reports import generate_campaign_markdown_summary
-from recon.scope import resolve_scope_target
 from recon.sourcemaps import analyze_sourcemap_sources_for_campaign
 from recon.sourcemaps import detect_sourcemap_references_for_campaign
 from recon.sourcemaps import download_sourcemap_for_campaign
@@ -29,9 +31,12 @@ def _error(message: str) -> dict:
 
 
 def _safe_label(value: str) -> str:
-    parsed = urlsplit(value)
-    host = parsed.hostname or value
-    path = parsed.path.strip("/").replace("/", "-")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or value
+        path = parsed.path.strip("/").replace("/", "-")
+    except ValueError:
+        return "target"
     return slugify(f"{host}-{path}" if path else host, fallback="target", max_length=90)
 
 
@@ -51,8 +56,10 @@ def _save_json(campaign_id: str, recon_subdir: str, label: str, payload: dict) -
     return {"ok": True, **saved}
 
 
-def _wrapper_response(campaign_id: str, tool: str, target: str, result: dict, subdir: str, label: str, scope_decision: dict | None = None) -> dict:
-    artifact = {"tool": tool, "target": target, "result": result}
+def _wrapper_response(campaign_id: str, tool: str, target: str, result: dict, subdir: str, label: str) -> dict:
+    target = safe_target(target)
+    scope_decision = result.get("scope_decision")
+    artifact = {"tool": tool, "target": target, "result": result, "scope_decision": scope_decision}
     save = _save_json(campaign_id, subdir, label, artifact)
     warnings = list(result.get("warnings") or result.get("notes") or []) if isinstance(result, dict) else []
     audit = write_audit_event(
@@ -71,54 +78,55 @@ def _wrapper_response(campaign_id: str, tool: str, target: str, result: dict, su
     return {"ok": bool(result.get("ok", True)), "result": result, "path": save["path"], "warnings": warnings}
 
 
+@campaign_network("url")
 def fetch_headers_for_campaign(campaign_id: str, url: str) -> dict:
     """Fetch headers for an in-scope campaign URL and save the artifact."""
-    scope_decision = resolve_scope_target(url)
     result = fetch_headers(url)
-    return _wrapper_response(campaign_id, "fetch_headers_for_campaign", url, result, "headers", url, scope_decision)
+    return _wrapper_response(campaign_id, "fetch_headers_for_campaign", url, result, "headers", safe_target(url))
 
 
+@campaign_network("url")
 def fetch_robots_for_campaign(campaign_id: str, url: str) -> dict:
     """Fetch robots.txt for an in-scope campaign URL and save the artifact."""
-    scope_decision = resolve_scope_target(url)
     result = fetch_robots(url)
-    return _wrapper_response(campaign_id, "fetch_robots_for_campaign", url, result, "robots", url, scope_decision)
+    return _wrapper_response(campaign_id, "fetch_robots_for_campaign", url, result, "robots", safe_target(url))
 
 
+@campaign_network("url")
 def fetch_sitemap_for_campaign(campaign_id: str, url: str) -> dict:
     """Fetch sitemap.xml for an in-scope campaign URL and save the artifact."""
-    scope_decision = resolve_scope_target(url)
     result = fetch_sitemap(url)
-    return _wrapper_response(campaign_id, "fetch_sitemap_for_campaign", url, result, "sitemap", url, scope_decision)
+    return _wrapper_response(campaign_id, "fetch_sitemap_for_campaign", url, result, "sitemap", safe_target(url))
 
 
+@campaign_network("url")
 def collect_js_urls_for_campaign(campaign_id: str, url: str) -> dict:
     """Collect in-scope JavaScript URLs for a campaign and save the artifact."""
-    scope_decision = resolve_scope_target(url)
     result = collect_js_urls(url)
-    return _wrapper_response(campaign_id, "collect_js_urls_for_campaign", url, result, "js_urls", url, scope_decision)
+    return _wrapper_response(campaign_id, "collect_js_urls_for_campaign", url, result, "js_urls", safe_target(url))
 
 
+@campaign_network("file_or_url", uses_network=lambda args: js_input_type(args["file_or_url"], args["source_type"]) == "url")
 def extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_type: str | None = None) -> dict:
     """Extract endpoint candidates and score them for manual review."""
-    scope_decision = resolve_scope_target(file_or_url) if file_or_url.lower().startswith(("http://", "https://")) else None
     result = extract_endpoints_from_js(file_or_url, source_type=source_type)
     scored = score_endpoints(result.get("endpoints", [])) if result.get("ok") else {"ok": True, "endpoints": []}
     artifact = {
         "tool": "extract_endpoints_for_campaign",
-        "target": file_or_url,
+        "target": result.get("source", "<redacted>"),
+        "scope_decision": result.get("scope_decision"),
         "source_type": source_type,
         "result": result,
         "scored_endpoints": scored.get("endpoints", []),
     }
-    save = _save_json(campaign_id, "endpoints", file_or_url, artifact)
+    save = _save_json(campaign_id, "endpoints", artifact["target"], artifact)
     warnings = list(result.get("notes") or [])
     audit = write_audit_event(
         campaign_id,
         "extract_endpoints_for_campaign",
-        target=file_or_url,
+        target=artifact["target"],
         ok=bool(result.get("ok")),
-        scope_decision=scope_decision,
+        scope_decision=result.get("scope_decision"),
         result_path=save.get("path") if save.get("ok") else None,
         warnings=warnings + ([save.get("error")] if not save.get("ok") else []),
         metadata={"scored_count": scored.get("count", 0)},
@@ -130,6 +138,7 @@ def extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_ty
     return {"ok": bool(result.get("ok")), "result": result, "scored_endpoints": scored.get("endpoints", []), "path": save["path"], "warnings": warnings}
 
 
+@campaign_operation
 def save_dirfuzz_analysis_for_campaign(campaign_id: str, analysis: dict) -> dict:
     """Save analysis produced by the separate Go DirFuzz MCP server."""
     if not isinstance(analysis, dict):
@@ -233,6 +242,7 @@ def _campaign_summary_input(campaign_id: str) -> dict:
     }
 
 
+@campaign_operation
 def generate_manual_test_plan_for_campaign(campaign_id: str) -> dict:
     """Generate and save a campaign manual test plan for authorized testing only."""
     paths = get_campaign_paths(campaign_id)
@@ -279,6 +289,7 @@ def generate_manual_test_plan_for_campaign(campaign_id: str) -> dict:
     return {"ok": True, "path": str(path), "metadata_path": saved["metadata_path"], "artifact_uuid": saved["artifact_uuid"], "plan": plan, "warnings": warnings}
 
 
+@campaign_operation
 def generate_campaign_summary(campaign_id: str) -> dict:
     """Generate and save a campaign summary for authorized testing only."""
     return generate_campaign_markdown_summary(campaign_id)

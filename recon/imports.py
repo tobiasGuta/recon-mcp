@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlsplit
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths
 from recon.evidence_graph import add_evidence_batch
@@ -71,6 +72,7 @@ def _input_path(campaign_id: str, value: str) -> Path:
     return safe_campaign_path(campaign_id, value, allowed_root=campaign, require_file=True)
 
 
+@campaign_operation
 def import_har_for_campaign(campaign_id: str, har_path: str) -> dict:
     try:
         path = _input_path(campaign_id, har_path)
@@ -114,6 +116,7 @@ def _decode_burp(value: str, encoded: bool) -> bytes:
         return b""
 
 
+@campaign_operation
 def import_burp_xml_for_campaign(campaign_id: str, xml_path: str) -> dict:
     try:
         path = _input_path(campaign_id, xml_path)

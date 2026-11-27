@@ -6,9 +6,9 @@ This project complements a separate Go DirFuzz MCP server. It does not implement
 
 ## Safety Model
 
-This server is designed for authorized, low-risk security testing only. Every network-facing Python tool checks configured scope before making requests and before following redirect targets. HTTP behavior is read-only, uses timeouts and small request delays, and avoids custom attack payloads.
+This server is designed for authorized, low-risk security testing only. Every network-facing Python tool uses the active policy to check the actual outbound URL before DNS and dispatch, including each redirect and fallback. HTTP behavior is read-only, uses timeouts and small request delays, and avoids custom attack payloads.
 
-Recon MCP blocks literal local, loopback, private, link-local, multicast, reserved, and unspecified IP targets. It also resolves hostnames before requests and before following redirects, then blocks any hostname that resolves to those unsafe IP ranges. This helps reduce DNS rebinding and accidental internal-network request risks while preserving a fail-closed recon model.
+Recon MCP validates the full DNS answer set and connects to a checked numeric address. Each request opens a fresh connection while keeping the authorized hostname for HTTP Host, TLS SNI, and certificate verification. See [Scope authorization](docs/scope-authorization.md) for the transport boundary and residual limitations.
 
 Sitemap XML parsing uses `defusedxml` so unsafe XML constructs are rejected safely instead of being parsed by the standard library XML parser.
 
@@ -34,7 +34,7 @@ output/campaigns/<campaign_id>/
   reports/
 ```
 
-Campaign-aware tools save JSON artifacts into the matching `recon/` subfolder and append audit events to `audit.jsonl`. Network-facing campaign tools still rely on the existing scope-enforced fetch and JavaScript helpers.
+Campaign-aware tools save JSON artifacts into the matching `recon/` subfolder and append events to `audit.jsonl`. A bounded storage-wide lock coordinates threads and processes on supported local Linux filesystems. Network operations require a current policy binding. Legacy campaigns and campaigns with a changed policy require [local reauthorization](docs/scope-authorization.md#campaign-reauthorization).
 
 Recommended campaign flow:
 
@@ -111,7 +111,7 @@ Source map workflow:
 
 ## Deterministic local analysis
 
-The architecture keeps one safety path instead of parallel subsystems: `scope.py` owns authorization, `http_fetch.py` owns streamed target requests and redirect/DNS checks, `safeio.py` owns campaign path and artifact boundaries, `audit.py` owns append-only operation history, and the existing campaign/finding/report workflow remains the only promotion path. Feature modules contribute redacted structured artifacts and evidence-graph observations through those shared layers.
+`authorization.py` compiles scope policies and evaluates complete URLs. `scope.py` also provides host inventory for evidence workflows. `http_fetch.py` handles bounded HTTP transport, redirect checks, and DNS preflight. Campaign files and audit records use `safeio.py` and `audit.py`.
 
 `scan_sensitive_artifacts_for_campaign` analyzes only approved campaign-local text. It returns minimal prefix/suffix redactions and SHA-256 fingerprints; complete candidates and surrounding source lines are never returned, persisted, logged, or placed in reports. Private-key candidates expose only their type/header, location, and fingerprint. Placeholder values are downgraded, and public client identifiers such as Stripe publishable keys, Sentry DSNs, Firebase configuration, and Google browser API keys are separate client-configuration signals. The tool never tests a credential.
 
@@ -121,7 +121,7 @@ The architecture keeps one safety path instead of parallel subsystems: `scope.py
 
 The campaign evidence graph records normalized, redacted nodes, edges, provenance, confidence, scope decisions, and observation history. Graph summaries and neighborhood queries are bounded; the entire graph is not returned by default. `import_dirfuzz_evidence_for_campaign` adapts analysis already saved by the existing DirFuzz handoff. The stable version 1.0 schema is documented in [Security Design](docs/security-design.md).
 
-Passive discovery queries fixed public provider APIs, so it does make external requests and reveals the authorized root domain to those providers. It does not contact discovered subdomains. Exact apex authorization permits recording children only as out-of-scope leads; wildcard authorization is required before children become testable. Optional DNS resolution is explicit, bounded, and never followed by HTTP probing.
+Passive discovery can disclose an authorized root domain to fixed public providers when the active policy also authorizes each provider request URL. An apex rule alone permits recording child domains as leads. With optional DNS enabled, only children whose HTTPS root URL passes current policy are resolved. The discovery tool sends no HTTP requests to discovered children.
 
 `compare_campaign_recon` compares normalized artifacts rather than timestamps or generated filenames. It produces structured JSON and Markdown for added, removed, or changed recon observations, using only detector IDs and fingerprints for secret candidates. Differences remain recon leads.
 
@@ -135,7 +135,21 @@ Nuclei is intentionally not executed here. A future separate Nuclei MCP must use
 
 ## Installation
 
-Use Python 3.11 or newer.
+Install Python 3.11 or newer. Recon MCP requires MCP SDK 1.x (`mcp>=1.0.0,<2.0.0`). Fedora qualification used Python 3.15.2, MCP 1.30.0, HTTPX 0.29.0, and HTTPCore 1.0.9. The transport uses the Certifi CA bundle and the HTTPX 0.29.x and HTTPCore 1.0.x public transport APIs. The Fedora qualification exercised real TLS against an isolated loopback fixture.
+
+**Fedora and Linux**
+
+On Fedora, install Python and pip with `sudo dnf install python3 python3-pip`, then run from the repository root.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+The TLS qualification tests require the OpenSSL CLI. On Fedora, install it with `sudo dnf install openssl` if it is missing. [Campaign storage permissions](docs/scope-authorization.md#fedora-campaign-storage) explains how to review an existing checkout created with `umask 0002`.
+
+**Windows PowerShell**
 
 ```powershell
 python -m venv .venv
@@ -143,41 +157,22 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-## Configure Scope
+If PowerShell restricts activation scripts, invoke `.\.venv\Scripts\python.exe` directly. Windows execution remains unverified. Campaign storage operations require the supported Linux lock backend. Offline scope diagnostics are available without a campaign storage lock.
 
-Create a local `config/scope.json` from `config/scope.example.json`, then edit it for your authorized target scope. The local `config/scope.json` file is ignored so personal snapshot paths and active program scope do not get pushed.
+## Configure scope
 
-```json
-{
-  "scope_source": "manual",
-  "h1_snapshot_dir": "",
-  "include_only_bounty_eligible": false,
-  "include_only_submission_eligible": true,
-  "allowed_assets": [
-    {"value": "api.example.com", "match": "exact"},
-    {"value": "*.example.com", "match": "wildcard"}
-  ],
-  "allowed_domains": [],
-  "user_agent": "ReconMCP/0.1",
-  "request_delay_ms": 500,
-  "max_requests_per_tool_call": 20,
-  "fetch_headers_method": "HEAD",
-  "blocked_domains": [
-    "localhost",
-    "127.0.0.1",
-    "0.0.0.0",
-    "::1"
-  ]
-}
+Place your reviewed policy in `config/scope.json`, which Git ignores. Choose one source, `manual`, `h1_snapshots`, or `burp_advanced`. A missing file means empty scope. Edits and revocations take effect on the next policy read.
+
+```bash
+.venv/bin/python -m recon.scope_cli validate --config config/scope.example.json
+.venv/bin/python -m recon.scope_cli check https://api.example.com/ --config config/scope.example.json
 ```
 
-Set `scope_source` to `h1_snapshots` to load local H1-Scope-Watcher JSON files for scope checks. Scope config is cached briefly, and new snapshots are picked up without restarting the MCP server. Set `scope_source` to `manual` to use `allowed_domains` instead.
-
-Exact assets authorize only the normalized host. Wildcard assets authorize child and deeply nested subdomains but exclude the apex. Legacy plain `allowed_domains` entries now migrate as exact assets; only an explicit `*.example.com` legacy entry is a wildcard. This safer behavior intentionally replaces the former implicit-subdomain authorization. H1 wildcard entries remain normalized into host rules. IDNs are normalized, while malformed assets and unsafe IPs fail closed.
+The [scope authorization guide](docs/scope-authorization.md) covers URL restrictions, Burp examples, H1 eligibility and freshness, offline migration checks, and campaign reauthorization.
 
 Request hygiene settings:
 
-- `user_agent` sets the User-Agent used by read-only HTTP helpers. The default is `ReconMCP/0.1`.
+- `user_agent` sets the User-Agent used by read-only HTTP helpers. The default is `ReconMCP/0.2`.
 - `request_delay_ms` adds a small delay before network requests. The default is `500`.
 - `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
 - `check_scope_batch` accepts up to 200 hosts or URLs per call.
@@ -283,6 +278,10 @@ Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share this MCP
 configuration. In the graphical clients, you can instead add an MCP server in
 Settings, choose **STDIO**, and enter the same command and argument.
 
+### Gemini CLI analyst setup
+
+Use Codex as the campaign operator and Gemini as the independent analyst. The [Gemini CLI read-only allowlist](docs/scope-authorization.md#codex-and-gemini) exposes offline diagnostics and selected historical reads through the same STDIO startup command.
+
 ### Other stdio MCP clients
 
 Clients that use JSON configuration commonly accept a structure like this. The
@@ -360,11 +359,17 @@ The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCO
 - `recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict])`
 - `explain_scope_decision(host_or_url: str)`
 - `list_loaded_scope()`
+- `validate_scope_policy()`
+- `check_url_scope(url: str)`
+- `check_url_scope_batch(urls: list[str])`
+- `get_scope_policy_summary()`
+- `compare_scope_policies(before: str, after: str)`
+- `get_scope_capabilities()`
 - `fetch_headers(url: str)`
 - `fetch_robots(url: str)`
 - `fetch_sitemap(url: str)`
 - `collect_js_urls(url: str)`
-- `extract_endpoints_from_js(file_or_url: str)`
+- `extract_endpoints_from_js(file_or_url: str, source_type: str | None = None)`
 - `dedupe_urls(urls: list[str])`
 - `create_evidence_note(finding: dict)`
 - `generate_manual_test_plan(target_summary: dict)`
@@ -432,55 +437,29 @@ For campaign mode, prefer the campaign workflow above. Candidate findings are no
 
 ## Project Layout
 
-```text
-recon-mcp/
-├── pyproject.toml
-├── README.md
-├── server.py
-├── config/
-│   └── scope.example.json
-├── recon/
-│   ├── __init__.py
-│   ├── h1_scope.py
-│   ├── scope.py
-│   ├── http_fetch.py
-│   ├── js_analysis.py
-│   ├── urls.py
-│   ├── notes.py
-│   ├── planner.py
-│   ├── campaigns.py
-│   ├── audit.py
-│   ├── workflow.py
-│   ├── findings.py
-│   ├── endpoint_scoring.py
-│   ├── memory.py
-│   ├── sourcemaps.py
-│   └── reports.py
-├── output/
-│   ├── logs/
-│   ├── evidence/
-│   ├── campaigns/
-│   └── reports/
-└── tests/
-    ├── test_scope.py
-    ├── test_h1_scope.py
-    ├── test_urls.py
-    └── test_js_analysis.py
-```
+| Location | Responsibility |
+| --- | --- |
+| `server.py` | STDIO MCP entry point and tool registration |
+| `config/` | Synthetic manual and Burp examples. Git ignores the active policy. |
+| `recon/authorization.py`, `scope.py`, `h1_scope.py`, `policy_io.py`, `scope_cli.py` | Policy compilation, legacy host inventory, safe policy reads, and local CLI |
+| `recon/http_fetch.py`, `pinned_transport.py` | Shared request authorization, DNS checks, numeric connections, TLS, and bounded reads |
+| `recon/campaigns.py`, `campaign_scope.py`, `campaign_lock.py`, `campaign_jsonl.py` | Campaign metadata, current policy bindings, storage locking, and coordinated history |
+| `recon/safeio.py`, `integrity.py`, `audit.py`, `evidence_graph.py`, `memory.py` | Campaign file safety, artifact publication and verification, audit and evidence |
+| `recon/js_analysis.py`, `sourcemaps.py`, `passive.py`, and other analysis modules | Bounded target or campaign workflows |
+| `docs/`, `tests/`, `output/` | Operational and audit documentation, offline regression tests, and ignored generated campaign files |
 
 ## Development
 
-Run tests:
+Run these commands from the repository root on Fedora.
 
-```powershell
-pytest
+```bash
+.venv/bin/python -m pytest
+.venv/bin/python -m pip check
+.venv/bin/python server.py </dev/null
+git diff --check
 ```
 
-Run the server:
-
-```powershell
-python .\server.py
-```
+Use the [final qualification report](docs/v0.2.0-final-qualification-report.md) for the independent re-audit conditions, regression commands, and qualification limits.
 
 ## Disclaimer
 

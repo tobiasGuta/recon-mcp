@@ -4,28 +4,25 @@
 
 Recon MCP is an authorized, low-risk, human-led reconnaissance assistant. It organizes passive evidence and deterministic local analysis. It is not an autonomous vulnerability scanner and does not validate, exploit, replay, submit, or automatically promote findings.
 
-The MCP client is a decision-support boundary, not a secret-processing service. Sensitive scanner and imported-traffic processing stays local. No source, secret candidate, request body, response body, or campaign artifact is sent to an AI or other analysis API. Passive provider adapters are the only new external-service boundary: they query fixed public certificate-transparency or OTX endpoints and do not contact discovered target hosts.
+Recon MCP hands tool results to the connected client over STDIO. Local analyzers run in the server process. Passive provider requests disclose the queried root domain when the active policy explicitly allows the provider URL. The client can have additional data-handling behavior of its own.
 
 DirFuzz and any future Nuclei implementation remain separate MCP servers with separate trust boundaries. Recon MCP only imports their already-saved, structured, redacted output.
 
 ## Data flow
 
-1. A target is normalized and checked against the current scope configuration or snapshot.
-2. Network operations resolve every target and redirect hop and reject private, local, reserved, or out-of-scope destinations.
-3. Response streams stop as soon as the applicable byte limit is exceeded.
-4. Campaign-aware tools store bounded structured artifacts beneath that campaign and append an audit event.
-5. Deterministic analyzers emit recon leads with `manual_validation_required: true`.
-6. Humans separately decide whether and how to validate a lead with authorized accounts and non-destructive methods.
+1. The shared engine parses the actual HTTP(S) URL and compiles the active local policy.
+2. The engine checks exclusions, inclusions, transport-independent address restrictions, and the campaign binding when present.
+3. Only authorized URLs reach DNS. The transport checks every returned IP, revalidates policy before dispatch, and connects to an approved numeric address. It preserves the target hostname for HTTP and verified TLS.
+4. Redirects, retries, fallbacks, and derived URLs repeat these checks. Each request gets its own pool and connection. Response streams stop at the applicable byte limit.
+5. Campaign tools attach redacted authorization provenance to audit events and artifacts.
 
 ## Scope enforcement
 
-Manual exact assets authorize only that normalized host. Wildcard assets authorize children, including deeply nested children, but exclude the apex. Legacy `allowed_domains` values are migrated safely: plain values are exact, and only an explicit `*.` prefix creates a wildcard. IDNs normalize to ASCII. Malformed assets and private, local, reserved, multicast, link-local, or unspecified IP addresses fail closed.
-
-Scope decisions use stable reason codes including `exact_scope_match`, `wildcard_scope_match`, `no_matching_asset`, `unsupported_asset`, `blocked_target`, and eligibility-specific codes for imported snapshot scope.
+[Scope authorization](scope-authorization.md) specifies each source, the rule subset, decision reason codes, migration, and offline verification. Legacy host inventory remains available for evidence organization. Complete URL decisions drive network authorization.
 
 ## Local file boundary
 
-Campaign tools accept only resolved paths under the campaign or a narrower documented campaign subdirectory. Traversal and symlinks are rejected. Reads are bounded before parsing. Artifact writes use a same-directory temporary file and atomic replacement, and failed writes remove the temporary file. HAR and Burp files must already be in the campaign (the `imports` directory is recommended); imports never replay traffic.
+Campaign tools accept only resolved paths under the campaign or a narrower documented campaign subdirectory. A private lock file beside the active and archived roots provides one transaction boundary for supported Linux campaign operations. Traversal and symlinks are rejected. Reads are bounded before parsing. Artifact writes use a same-directory temporary file and atomic replacement, and failed writes remove the temporary file. HAR and Burp files must already be in the campaign (the `imports` directory is recommended); imports never replay traffic.
 
 ## Secret handling
 
@@ -47,13 +44,13 @@ The enumerations in `recon/evidence_graph.py` are the compatibility contract for
 
 ## Artifact integrity and provenance
 
-New structured artifacts contain an artifact UUID, tool/project versions, creation time, scope-snapshot hash, parent/input IDs, truncation status, and applied limits. A sibling `.metadata.json` contains the SHA-256 calculated from the final artifact bytes. Verification is read-only and reports verified, missing, modified, malformed, and unsupported legacy artifacts without rewriting evidence.
+New structured artifacts contain an artifact UUID, tool/project versions, creation time, scope-snapshot hash, parent/input IDs, truncation status, and applied limits. A sibling `.metadata.json` contains the SHA-256 calculated from the final artifact bytes. The writer synchronizes an update marker before replacing either file. The verifier shares the storage lock and reports a surviving marker as an interrupted pair. Audit and negative-result history use descriptor-relative append and recover a bounded unterminated tail. Verification is read-only and reports verified, missing, modified, malformed, and unsupported legacy artifacts without rewriting evidence.
 
 ## XML, subprocess, and external interaction policy
 
 Burp XML and sitemap parsing use `defusedxml`; entity expansion, DTD-based attacks, and external entities fail closed. Recon MCP does not need subprocesses for these features and does not use `shell=True`. It does not execute Nuclei or external source-map tools.
 
-Passive providers necessarily receive the queried authorized root domain. DNS resolution is off by default and, when explicitly enabled, performs only bounded DNS lookups, rejects unsafe results, and does not probe HTTP.
+Passive providers necessarily receive the queried authorized root domain. Optional DNS resolution is off by default and uses the same current-policy and public-address checks for eligible HTTPS roots.
 
 ## Human approval points
 
@@ -64,6 +61,10 @@ Passive providers necessarily receive the queried authorized root domain. DNS re
 - Reports remain local drafts and are never submitted.
 - A future Nuclei MCP must build an exact-template, one-target plan and require explicit approval before execution.
 
+## Final qualification boundaries
+
+The final regression suite detects userinfo in nested query URLs and checks that diagnostics, HTTP errors, audit records, and artifact metadata suppress the recognized credentials. The shared inspection is bounded, and raw source evidence retains its original bytes. Campaign directories are private, and the storage lock requires a supported local Linux filesystem and GIL-enabled CPython. The trusted, untrusted, and wrong-host TLS cases used real loopback connections and temporary test certificates. [Final qualification report](v0.2.0-final-qualification-report.md)
+
 ## Threat model and limitations
 
-Controls address SSRF, redirects, DNS rebinding, private-network access, oversized streams/files, traversal, symlinks, XML entities, secret leakage, unbounded result sets, evidence tampering, and accidental promotion of recon leads. Deterministic regex extraction can miss obfuscated code and can produce false positives; uncertainty and confidence are therefore explicit. Passive providers may be unavailable, incomplete, rate-limited, or privacy-sensitive. Artifact hashes detect modification but do not provide signatures or an external timestamp authority. Existing legacy artifacts without sidecars remain readable but are reported as unsupported legacy evidence.
+Controls address unauthorized requests, unsafe DNS answers, oversized streams and files, path traversal, XML entities, secret leakage, and evidence modification. The transport pins the TCP peer within the application socket boundary. Local routing, NAT, and infrastructure interceptors can still redirect traffic after that boundary. Campaign synchronization requires a supported local Linux mount and cooperating processes. See [Operational limits](scope-authorization.md#operational-limits). Deterministic regex extraction can miss obfuscated code and can produce false positives; uncertainty and confidence are therefore explicit. Passive providers may be unavailable, incomplete, rate-limited, or privacy-sensitive. Artifact hashes detect modification but do not provide signatures or an external timestamp authority. Existing legacy artifacts without sidecars remain readable but are reported as unsupported legacy evidence.

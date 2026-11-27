@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
 
-from recon.http_fetch import BoundedReadError, safe_get_text
+from recon.authorization import AuthorizationError, evaluate, load_policy, parse_target, policy_failure, safe_target
+from recon.http_fetch import BoundedReadError, redirect_url, safe_get_text_with_response
 from recon.redaction import redact_endpoint
 from recon.safeio import SafeIOError, read_text_bounded
-from recon.scope import DEFAULT_LIMITS, DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, check_scope, load_scope
+from recon.scope import DEFAULT_LIMITS, DEFAULT_MAX_REQUESTS_PER_TOOL_CALL, ScopeError, load_scope
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,11 +34,15 @@ ENDPOINT_PATTERNS = {
 }
 
 
-def _fetch_text(url: str) -> str:
-    """Fetch text from an in-scope URL."""
-    suffix = Path(urlsplit(url).path).suffix.lower()
+def _fetch_text(url: str) -> tuple[str, str, dict]:
+    """Read JavaScript or HTML and keep the final authorized response URL."""
+    suffix = Path(parse_target(url).path).suffix.lower()
     is_javascript = suffix in ALLOWED_JS_SUFFIXES
-    return safe_get_text(url, limit_name="max_javascript_bytes" if is_javascript else "max_html_bytes", content_type="JavaScript" if is_javascript else "HTML")
+    text, response = safe_get_text_with_response(
+        url, limit_name="max_javascript_bytes" if is_javascript else "max_html_bytes",
+        content_type="JavaScript" if is_javascript else "HTML",
+    )
+    return text, str(response.url), response.extensions["scope_decision"]
 
 
 def get_max_requests_per_tool_call() -> int:
@@ -46,51 +50,40 @@ def get_max_requests_per_tool_call() -> int:
     return max(1, int(load_scope().get("max_requests_per_tool_call", DEFAULT_MAX_REQUESTS_PER_TOOL_CALL)))
 
 
-def _is_same_origin_or_in_scope(page_url: str, candidate_url: str) -> bool:
-    """Return True when a script URL is same-origin or allowed by configured scope."""
-    page = urlsplit(page_url)
-    candidate = urlsplit(candidate_url)
-    if page.scheme == candidate.scheme and page.netloc.lower() == candidate.netloc.lower():
-        return True
-    return bool(check_scope(candidate_url).get("in_scope"))
-
-
 def collect_js_urls(url: str) -> dict:
-    """Collect same-origin or in-scope JavaScript URLs from an HTML page."""
+    """Collect script URLs permitted by the active URL policy."""
+    page_url = safe_target(url)
     try:
-        html = _fetch_text(url)
-    except ScopeError as exc:
-        return {"ok": False, "page_url": url, "error": str(exc)}
-    except (httpx.HTTPError, BoundedReadError) as exc:
-        return {"ok": False, "page_url": url, "error": f"HTTP request failed: {exc}"}
+        html, base, scope_decision = _fetch_text(url)
+        maximum = get_max_requests_per_tool_call()
+        policy = load_policy()
+    except (ScopeError, OSError) as exc:
+        failure = getattr(exc, "decision", None) or policy_failure(exc)
+        return {"ok": False, "page_url": page_url, "error": failure["reason"], "scope_decision": failure}
+    except (httpx.HTTPError, BoundedReadError):
+        return {"ok": False, "page_url": page_url, "error": "Could not read a bounded HTTP response."}
 
     soup = BeautifulSoup(html, "html.parser")
     js_urls = set()
     for script in soup.find_all("script"):
         src = script.get("src")
-        if not src:
+        if not isinstance(src, str) or not src:
             continue
-        absolute_url = urljoin(url, src)
-        if _is_same_origin_or_in_scope(url, absolute_url):
-            js_urls.add(absolute_url)
-            if len(js_urls) > get_max_requests_per_tool_call():
+        try:
+            target = parse_target(redirect_url(base, src))
+        except AuthorizationError:
+            continue
+        if evaluate(policy, target, expected_fingerprint=scope_decision["policy_fingerprint"])["authorized"]:
+            js_urls.add(target.redacted)
+            if len(js_urls) > maximum:
                 return {
-                    "ok": True,
-                    "page_url": url,
-                    "js_urls": sorted(js_urls)[: get_max_requests_per_tool_call()],
-                    "count": get_max_requests_per_tool_call(),
-                    "truncated": True,
+                    "ok": True, "page_url": page_url, "scope_decision": scope_decision,
+                    "js_urls": sorted(js_urls)[:maximum], "count": maximum, "truncated": True,
                     "warning": "JavaScript URL results were truncated at the configured limit.",
-                    "max_requests_per_tool_call": get_max_requests_per_tool_call(),
+                    "max_requests_per_tool_call": maximum,
                 }
-
-    return {
-        "ok": True,
-        "page_url": url,
-        "js_urls": sorted(js_urls),
-        "count": len(js_urls),
-        "truncated": False,
-    }
+    return {"ok": True, "page_url": page_url, "scope_decision": scope_decision,
+            "js_urls": sorted(js_urls), "count": len(js_urls), "truncated": False}
 
 
 def _read_local_js_file(file_or_url: str) -> str:
@@ -111,11 +104,12 @@ def _read_local_js_file(file_or_url: str) -> str:
         raise OSError(str(exc)) from exc
 
 
-def _read_js_input(file_or_url: str) -> tuple[str, str]:
-    """Read JavaScript from a URL or local file path for backward compatibility."""
-    if re.match(r"^https?://", file_or_url, flags=re.IGNORECASE):
-        return _fetch_text(file_or_url), "url"
-    return _read_local_js_file(file_or_url), "file"
+def js_input_type(file_or_url: str, source_type: str | None) -> str:
+    if source_type is not None:
+        return source_type.lower()
+    if "\n" in file_or_url or "function " in file_or_url or "=>" in file_or_url:
+        return "raw"
+    return "url" if re.match(r"^https?://", file_or_url, flags=re.IGNORECASE) else "file"
 
 
 def _categorize_endpoint(category: str, value: str) -> str:
@@ -129,7 +123,7 @@ def _categorize_endpoint(category: str, value: str) -> str:
     return category
 
 
-def parse_sourcemap_references(js_text: str, js_url: str | None = None) -> list[dict]:
+def parse_sourcemap_references(js_text: str, js_url: str | None = None, *, request_urls: dict[int, str] | None = None) -> list[dict]:
     """Parse sourceMappingURL comments without downloading anything."""
     references = []
     seen = set()
@@ -145,29 +139,27 @@ def parse_sourcemap_references(js_text: str, js_url: str | None = None) -> list[
             reason = "inline data URI source map; manual review only"
             safe_to_download = False
             display_raw = "<inline-data-uri-redacted>"
-        elif lowered.startswith(("http://", "https://")):
-            kind = "absolute"
-            resolved_url = raw
-            reason = "absolute source map URL"
-            safe_to_download = True
-            display_raw = redact_endpoint(raw)
-        elif js_url:
-            kind = "relative"
-            resolved_url = urljoin(js_url, raw)
-            reason = "relative source map resolved against JS URL"
-            safe_to_download = True
-            display_raw = redact_endpoint(raw)
         else:
-            kind = "unknown"
-            reason = "relative source map cannot be resolved without js_url"
+            absolute = lowered.startswith(("http://", "https://"))
+            kind = "absolute" if absolute else "relative" if js_url else "unknown"
+            reason = "Source map URL requires scope validation."
             safe_to_download = False
-            display_raw = redact_endpoint(raw)
-        if resolved_url:
-            redacted_resolved = redact_endpoint(resolved_url)
-            if redacted_resolved != resolved_url:
-                safe_to_download = False
-                reason += "; sensitive URL values were redacted and will not be requested"
-            resolved_url = redacted_resolved
+            display_raw = redact_endpoint(raw.split("?", 1)[0].split("#", 1)[0])
+            if "?" in raw:
+                display_raw += "?<redacted>"
+            try:
+                target = parse_target(raw if absolute or not js_url else redirect_url(js_url, raw))
+            except AuthorizationError:
+                reason = "Source map reference could not be safely resolved."
+                if absolute:
+                    display_raw = safe_target(raw)
+                elif raw.startswith("//"):
+                    display_raw = "<redacted-invalid-or-sensitive-reference>"
+            else:
+                safe_to_download = True
+                resolved_url = target.redacted
+                if request_urls is not None:
+                    request_urls[len(references)] = target.url
         references.append(
             {
                 "raw": display_raw,
@@ -182,33 +174,28 @@ def parse_sourcemap_references(js_text: str, js_url: str | None = None) -> list[
 
 def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) -> dict:
     """Extract likely endpoints from a JavaScript URL, local file, or source string."""
+    resolved_source_type = js_input_type(file_or_url, source_type)
+    source = safe_target(file_or_url) if resolved_source_type == "url" else (
+        "provided_raw" if resolved_source_type == "raw" else redact_endpoint(file_or_url)
+    )
+    scope_decision = None
     try:
-        if source_type is not None:
-            normalized_source_type = source_type.lower()
-            if normalized_source_type == "url":
-                js_text = _fetch_text(file_or_url)
-            elif normalized_source_type == "file":
-                js_text = _read_local_js_file(file_or_url)
-            elif normalized_source_type == "raw":
-                js_text = file_or_url
-                if len(js_text.encode("utf-8")) > int(load_scope().get("max_javascript_bytes", DEFAULT_LIMITS["max_javascript_bytes"])):
-                    return {"ok": False, "source": "provided_raw", "source_type": "raw", "error": "Raw JavaScript exceeds configured maximum."}
-            else:
-                return {
-                    "ok": False,
-                    "source": file_or_url,
-                    "source_type": source_type,
-                    "error": "source_type must be one of: url, file, raw.",
-                }
-            resolved_source_type = normalized_source_type
-        elif "\n" in file_or_url or "function " in file_or_url or "=>" in file_or_url:
-            js_text, resolved_source_type = file_or_url, "raw"
+        if resolved_source_type == "url":
+            js_text, _, scope_decision = _fetch_text(file_or_url)
+        elif resolved_source_type == "file":
+            js_text = _read_local_js_file(file_or_url)
+        elif resolved_source_type == "raw":
+            js_text = file_or_url
+            if len(js_text.encode("utf-8")) > int(load_scope().get("max_javascript_bytes", DEFAULT_LIMITS["max_javascript_bytes"])):
+                return {"ok": False, "source": source, "source_type": "raw", "error": "Raw JavaScript exceeds configured maximum."}
         else:
-            js_text, resolved_source_type = _read_js_input(file_or_url)
+            return {"ok": False, "source_type": source_type, "error": "source_type must be one of: url, file, raw."}
     except ScopeError as exc:
-        return {"ok": False, "source": file_or_url, "error": str(exc)}
-    except (OSError, httpx.HTTPError, BoundedReadError) as exc:
-        return {"ok": False, "source": file_or_url, "error": f"Could not read JavaScript: {exc}"}
+        return {"ok": False, "source": source, "error": str(exc), "scope_decision": getattr(exc, "decision", None)}
+    except (httpx.HTTPError, BoundedReadError):
+        return {"ok": False, "source": source, "error": "Could not read a bounded HTTP response."}
+    except OSError as exc:
+        return {"ok": False, "source": source, "error": f"Could not read JavaScript: {exc}"}
 
     seen_values = set()
     endpoints = []
@@ -230,7 +217,8 @@ def extract_endpoints_from_js(file_or_url: str, source_type: str | None = None) 
     endpoints.sort(key=lambda item: (item["category"], item["value"]))
     return {
         "ok": True,
-        "source": file_or_url if resolved_source_type != "raw" else "provided_raw",
+        "source": source,
+        "scope_decision": scope_decision,
         "source_type": resolved_source_type,
         "endpoints": endpoints,
         "count": len(endpoints),

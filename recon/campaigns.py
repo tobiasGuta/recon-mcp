@@ -10,7 +10,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from recon.scope import normalize_domain, resolve_scope_target
+from recon.campaign_lock import CampaignLockError, campaign_operation, check_campaign_directory, open_directory
+from recon.authorization import AuthorizationError, normalize_host, require_url
+from recon.policy_io import PolicyFileError, read_policy_json
 from recon.redaction import redact_structure
 
 
@@ -44,7 +46,7 @@ def iso_now() -> str:
 
 def file_timestamp() -> str:
     """Return a compact UTC timestamp for filenames."""
-    return utc_now().strftime("%Y%m%dT%H%M%SZ")
+    return utc_now().strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def slugify(value: str, *, fallback: str = "item", max_length: int = 80) -> str:
@@ -75,10 +77,16 @@ def _resolve_campaign_root(campaign_id: str, *, must_exist: bool = True) -> tupl
         return None, "Unsafe campaign_id."
     base = CAMPAIGNS_DIR.resolve()
     root = _campaign_root(campaign_id)
+    if CAMPAIGNS_DIR.is_symlink() or root.is_symlink():
+        return None, "Campaign storage path must not be a symlink."
     if must_exist and not root.exists():
         return None, "Campaign does not exist."
     try:
+        if must_exist or root.exists():
+            check_campaign_directory(root)
         resolved = root.resolve()
+    except CampaignLockError as exc:
+        return None, str(exc)
     except OSError as exc:
         return None, f"Could not resolve campaign path: {exc}"
     if resolved != base / campaign_id or not resolved.is_relative_to(base):
@@ -91,10 +99,16 @@ def _resolve_archived_campaign_root(campaign_id: str, *, must_exist: bool = True
         return None, "Unsafe campaign_id."
     base = ARCHIVED_CAMPAIGNS_DIR.resolve()
     root = _archived_campaign_root(campaign_id)
+    if ARCHIVED_CAMPAIGNS_DIR.is_symlink() or root.is_symlink():
+        return None, "Campaign storage path must not be a symlink."
     if must_exist and not root.exists():
         return None, "Archived campaign does not exist."
     try:
+        if must_exist or root.exists():
+            check_campaign_directory(root)
         resolved = root.resolve()
+    except CampaignLockError as exc:
+        return None, str(exc)
     except OSError as exc:
         return None, f"Could not resolve archived campaign path: {exc}"
     if resolved != base / campaign_id or not resolved.is_relative_to(base):
@@ -103,7 +117,7 @@ def _resolve_archived_campaign_root(campaign_id: str, *, must_exist: bool = True
 
 
 def _reject_symlink(path: Path, label: str) -> str | None:
-    if path.exists() and path.is_symlink():
+    if path.is_symlink():
         return f"{label} must not be a symlink."
     return None
 
@@ -149,19 +163,20 @@ def _create_layout(root: Path) -> str | None:
     if error:
         return error
     try:
-        root.mkdir(parents=True, exist_ok=False)
-        (root / "recon").mkdir()
+        root.parent.mkdir(mode=0o700, exist_ok=True)
+        root.mkdir(mode=0o700)
+        (root / "recon").mkdir(mode=0o700)
         for name in RECON_SUBDIRS:
-            (root / "recon" / name).mkdir()
+            (root / "recon" / name).mkdir(mode=0o700)
         for name in ("maps", "extracted", "analysis"):
-            (root / "recon" / "sourcemaps" / name).mkdir()
-        (root / "findings").mkdir()
+            (root / "recon" / "sourcemaps" / name).mkdir(mode=0o700)
+        (root / "findings").mkdir(mode=0o700)
         for name in FINDING_SUBDIRS:
-            (root / "findings" / name).mkdir()
-        (root / "evidence").mkdir()
-        (root / "imports").mkdir()
-        (root / "memory").mkdir()
-        (root / "reports").mkdir()
+            (root / "findings" / name).mkdir(mode=0o700)
+        (root / "evidence").mkdir(mode=0o700)
+        (root / "imports").mkdir(mode=0o700)
+        (root / "memory").mkdir(mode=0o700)
+        (root / "reports").mkdir(mode=0o700)
     except OSError as exc:
         return f"Could not create campaign layout: {exc}"
     return _guard_core_dirs(root)
@@ -189,7 +204,9 @@ def _write_json(path: Path, payload: dict) -> str | None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        temp_path.replace(path)
+        with open_directory(path.parent) as dirfd:
+            os.replace(temp_path.name, path.name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            os.fsync(dirfd)
     except OSError as exc:
         return f"Could not write {path.name}: {exc}"
     finally:
@@ -199,31 +216,39 @@ def _write_json(path: Path, payload: dict) -> str | None:
 
 
 def _read_json(path: Path, maximum: int = 2 * 1024 * 1024) -> dict:
-    if path.is_symlink() or not path.is_file():
-        raise OSError("JSON input must be a regular non-symlink file.")
-    if path.stat().st_size > maximum:
-        raise OSError(f"JSON input exceeds {maximum} bytes.")
-    with path.open("rb") as handle:
-        raw = handle.read(maximum + 1)
-    if len(raw) > maximum:
-        raise OSError(f"JSON input exceeded {maximum} bytes while reading.")
-    value = json.loads(raw)
+    try:
+        value, _ = read_policy_json(path, maximum)
+    except PolicyFileError as exc:
+        raise OSError(str(exc)) from exc
     if not isinstance(value, dict):
-        raise json.JSONDecodeError("Expected JSON object", raw.decode("utf-8", errors="replace"), 0)
+        raise OSError("Expected a JSON object.")
     return value
 
 
+def _authorize_campaign_anchor(target: str) -> tuple[str, dict]:
+    url = target
+    if "://" not in url:
+        try:
+            hostname = normalize_host(url)
+            url = f"https://[{hostname}]/" if ":" in hostname else f"https://{hostname}/"
+        except ValueError:
+            pass
+    normalized, scope_decision = require_url(url)
+    if normalized.query is not None or normalized.url != normalized.redacted:
+        raise AuthorizationError("Use an authorized campaign anchor without a query or sensitive values.",
+                                 code="invalid_campaign_anchor")
+    return normalized.url, scope_decision
+
+
+@campaign_operation
 def create_campaign(program: str, target: str, notes: str | None = None) -> dict:
     """Create a scoped campaign for authorized, human-led recon only."""
-    scope_decision = resolve_scope_target(target)
-    if not scope_decision.get("ok", True) or not scope_decision.get("in_scope"):
-        return {
-            "ok": False,
-            "error": "Target is not in configured scope; campaign was not created.",
-            "scope_decision": scope_decision,
-        }
+    try:
+        anchor, scope_decision = _authorize_campaign_anchor(target)
+    except AuthorizationError as exc:
+        return {"ok": False, "error": str(exc), "scope_decision": exc.decision}
 
-    normalized_host = scope_decision.get("normalized_host") or normalize_domain(target)
+    normalized_host = scope_decision["normalized_url"]["hostname"]
     campaign_id = _unique_campaign_id(program, normalized_host)
     if not is_safe_campaign_id(campaign_id):
         return _safe_error("Generated unsafe campaign_id.")
@@ -241,15 +266,16 @@ def create_campaign(program: str, target: str, notes: str | None = None) -> dict
     metadata = {
         "campaign_id": campaign_id,
         "program": str(program or ""),
-        "target": str(target or ""),
+        "target": anchor,
         "normalized_host": normalized_host,
         "created_at": now,
         "updated_at": now,
         "scope_decision": scope_decision,
+        "scope_binding": {"anchor": anchor, "bound_at": now, "decision": scope_decision},
         "safety_model": SAFETY_MODEL,
         "notes": [redact_structure(notes)] if notes else [],
     }
-    for path, payload in ((root / "campaign.json", metadata), (root / "scope.json", scope_decision)):
+    for path, payload in ((root / "scope.json", scope_decision), (root / "campaign.json", metadata)):
         error = _write_json(path, payload)
         if error:
             return _safe_error(error)
@@ -257,15 +283,54 @@ def create_campaign(program: str, target: str, notes: str | None = None) -> dict
     # Local import avoids an audit/campaign module cycle during initialization.
     from recon.audit import write_audit_event
 
-    write_audit_event(campaign_id, "create_campaign", target=target, ok=True, scope_decision=scope_decision, result_path=str(root / "campaign.json"), metadata={"program": str(program or "")})
+    write_audit_event(campaign_id, "create_campaign", target=anchor, ok=True, scope_decision=scope_decision, result_path=str(root / "campaign.json"), metadata={"program": str(program or "")})
 
     return {"ok": True, "campaign_id": campaign_id, "path": str(root), "scope_decision": scope_decision}
 
 
+@campaign_operation
+def reauthorize_campaign(campaign_id: str, target: str, confirm_fingerprint: str) -> dict:
+    """Bind an existing campaign to a manually reviewed policy from the local CLI."""
+    current = get_campaign(campaign_id)
+    if not current.get("ok"):
+        return current
+    try:
+        anchor, scope_decision = _authorize_campaign_anchor(target)
+    except AuthorizationError as exc:
+        return {"ok": False, "error": str(exc), "scope_decision": exc.decision}
+    if confirm_fingerprint != scope_decision["policy_fingerprint"]:
+        return _safe_error("Confirmation must match the current full policy fingerprint.")
+    metadata = current["campaign"]
+    if metadata.get("status") == "archived":
+        return _safe_error("Campaign archival is pending or complete.")
+    if metadata.get("normalized_host") != scope_decision["normalized_url"]["hostname"]:
+        return _safe_error("Anchor must use the campaign's original normalized hostname.")
+    now = iso_now()
+    previous = metadata.get("scope_binding")
+    previous_decision = previous.get("decision") if isinstance(previous, dict) else None
+    previous_fingerprint = previous_decision.get("policy_fingerprint") if isinstance(previous_decision, dict) else None
+    metadata["scope_binding"] = {"anchor": anchor, "bound_at": now, "decision": scope_decision}
+    metadata["updated_at"] = now
+
+    from recon.audit import write_audit_event
+
+    audit = write_audit_event(campaign_id, "reauthorize_campaign", target=anchor, scope_decision=scope_decision,
+                              metadata={"previous_policy_fingerprint": previous_fingerprint})
+    if not audit.get("ok"):
+        return _safe_error("Could not append the campaign policy review to its audit log.")
+    error = _write_json(_campaign_root(campaign_id) / "campaign.json", metadata)
+    if error:
+        write_audit_event(campaign_id, "reauthorize_campaign_write_failed", target=anchor, ok=False,
+                          scope_decision=scope_decision)
+        return _safe_error(error)
+    return {"ok": True, "campaign_id": campaign_id, "scope_decision": scope_decision}
+
+
+@campaign_operation
 def list_campaigns(limit: int = 50) -> dict:
     """List stored campaigns without following unsafe campaign IDs."""
     try:
-        CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+        CAMPAIGNS_DIR.mkdir(mode=0o700, exist_ok=True)
     except OSError as exc:
         return _safe_error(f"Could not create campaign storage: {exc}")
 
@@ -277,6 +342,7 @@ def list_campaigns(limit: int = 50) -> dict:
         if not metadata_path.exists():
             continue
         try:
+            check_campaign_directory(path)
             metadata = _read_json(metadata_path)
         except (OSError, json.JSONDecodeError):
             continue
@@ -287,6 +353,7 @@ def list_campaigns(limit: int = 50) -> dict:
     return {"ok": True, "campaigns": campaigns[:safe_limit], "count": min(len(campaigns), safe_limit)}
 
 
+@campaign_operation
 def get_campaign(campaign_id: str) -> dict:
     """Load campaign metadata for authorized, human-led recon only."""
     root, error = _resolve_campaign_root(campaign_id)
@@ -306,7 +373,11 @@ def get_campaign(campaign_id: str) -> dict:
 
 
 def get_campaign_paths(campaign_id: str) -> dict:
-    """Return safe campaign paths for authorized, human-led recon storage."""
+    """Resolve paths without retaining the lock across the caller's work.
+
+    Production callers hold campaign_storage_lock for the operation using these
+    paths. Standalone callers receive a snapshot that can become stale.
+    """
     root, error = _resolve_campaign_root(campaign_id)
     if error:
         return _safe_error(error)
@@ -317,8 +388,11 @@ def get_campaign_paths(campaign_id: str) -> dict:
     return {"ok": True, "campaign_id": campaign_id, "paths": _campaign_paths(root)}
 
 
+@campaign_operation
 def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
     """Move a campaign into archived_campaigns instead of deleting it."""
+    if ARCHIVED_CAMPAIGNS_DIR.parent.absolute() != CAMPAIGNS_DIR.parent.absolute():
+        return _safe_error("Active and archived campaigns must share a storage root.")
     source_root, error = _resolve_campaign_root(campaign_id)
     if error:
         return _safe_error(error)
@@ -330,7 +404,7 @@ def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
         return _safe_error(error)
 
     try:
-        ARCHIVED_CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+        ARCHIVED_CAMPAIGNS_DIR.mkdir(mode=0o700, exist_ok=True)
     except OSError as exc:
         return _safe_error(f"Could not create archived campaign storage: {exc}")
 
@@ -353,6 +427,7 @@ def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
 
     now = iso_now()
     archive_reason = reason or "Archived by user request."
+    original = dict(metadata)
     metadata["archived_at"] = now
     metadata["archive_reason"] = archive_reason
     metadata["updated_at"] = now
@@ -362,17 +437,30 @@ def archive_campaign(campaign_id: str, reason: str | None = None) -> dict:
         return _safe_error(error)
 
     try:
-        shutil.move(str(source_root), str(archive_root))
-    except OSError as exc:
-        return _safe_error(f"Could not archive campaign: {exc}")
+        # rename fails on cross-mount moves instead of starting a partial copy.
+        source_root.rename(archive_root)
+    except OSError:
+        restore_error = _write_json(metadata_path, original)
+        if restore_error:
+            return _safe_error("Could not archive campaign or restore metadata. Retry archival after checking storage.")
+        return _safe_error("Could not archive campaign. Check destination permissions and storage mount.")
 
+    try:
+        with open_directory(source_root.parent) as source, open_directory(archive_root.parent) as destination:
+            os.fsync(source)
+            os.fsync(destination)
+    except OSError:
+        return _safe_error("Campaign moved, but archive durability could not be verified.")
     return {"ok": True, "campaign_id": campaign_id, "archived_path": str(archive_root), "reason": archive_reason}
 
 
+@campaign_operation
 def list_archived_campaigns(limit: int = 50) -> dict:
     """List archived campaigns."""
+    if ARCHIVED_CAMPAIGNS_DIR.parent.absolute() != CAMPAIGNS_DIR.parent.absolute():
+        return _safe_error("Active and archived campaigns must share a storage root.")
     try:
-        ARCHIVED_CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
+        ARCHIVED_CAMPAIGNS_DIR.mkdir(mode=0o700, exist_ok=True)
     except OSError as exc:
         return _safe_error(f"Could not create archived campaign storage: {exc}")
     if ARCHIVED_CAMPAIGNS_DIR.is_symlink():
@@ -386,6 +474,7 @@ def list_archived_campaigns(limit: int = 50) -> dict:
         if not metadata_path.exists():
             continue
         try:
+            check_campaign_directory(path)
             metadata = _read_json(metadata_path)
         except (OSError, json.JSONDecodeError):
             continue
@@ -396,8 +485,11 @@ def list_archived_campaigns(limit: int = 50) -> dict:
     return {"ok": True, "campaigns": campaigns[:safe_limit], "count": min(len(campaigns), safe_limit)}
 
 
+@campaign_operation
 def get_archived_campaign(campaign_id: str) -> dict:
     """Read archived campaign metadata."""
+    if ARCHIVED_CAMPAIGNS_DIR.parent.absolute() != CAMPAIGNS_DIR.parent.absolute():
+        return _safe_error("Active and archived campaigns must share a storage root.")
     root, error = _resolve_archived_campaign_root(campaign_id)
     if error:
         return _safe_error(error)
@@ -416,8 +508,11 @@ def get_archived_campaign(campaign_id: str) -> dict:
     return {"ok": True, "campaign": metadata, "path": str(root)}
 
 
+@campaign_operation
 def delete_archived_campaign(campaign_id: str, confirm_campaign_id: str) -> dict:
     """Permanently delete an archived campaign only when confirmation matches."""
+    if ARCHIVED_CAMPAIGNS_DIR.parent.absolute() != CAMPAIGNS_DIR.parent.absolute():
+        return _safe_error("Active and archived campaigns must share a storage root.")
     if confirm_campaign_id != campaign_id:
         return _safe_error("Confirmation campaign_id does not match; archived campaign was not deleted.")
     root, error = _resolve_archived_campaign_root(campaign_id)

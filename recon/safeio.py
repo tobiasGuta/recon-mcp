@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from recon import __version__
+from recon.redaction import redact_structure, redact_text
+from recon.campaign_lock import campaign_storage_lock, open_directory
+from recon.campaign_scope import current_grant
 from recon.campaigns import get_campaign_paths, iso_now
-from recon.scope import DEFAULT_LIMITS, load_scope
+from recon.scope import DEFAULT_LIMITS, ScopeError, load_scope
+
+
+ARTIFACT_PENDING_SUFFIX = ".recon-pending"
 
 
 class SafeIOError(ValueError):
@@ -20,7 +26,10 @@ class SafeIOError(ValueError):
 
 
 def limit(name: str) -> int:
-    return int(load_scope().get(name, DEFAULT_LIMITS[name]))
+    try:
+        return int(load_scope().get(name, DEFAULT_LIMITS[name]))
+    except ScopeError:
+        return DEFAULT_LIMITS[name]
 
 
 def campaign_root(campaign_id: str) -> Path:
@@ -111,23 +120,23 @@ def atomic_write_bytes(path: Path, data: bytes, *, maximum: int | None = None) -
     maximum = maximum if maximum is not None else limit("max_saved_artifact_bytes")
     if len(data) > maximum:
         raise SafeIOError(f"Artifact exceeds configured maximum of {maximum} bytes.")
-    path.parent.mkdir(parents=True, exist_ok=True)
     current = path.parent
     while current != current.parent:
         if current.is_symlink():
             raise SafeIOError("Artifact path must not contain a symlink.")
         current = current.parent
-    if path.exists() and path.is_symlink():
+    if path.is_symlink():
         raise SafeIOError("Artifact path must not contain a symlink.")
     temp_path: Path | None = None
     try:
-        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        temp_path = Path(name)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp_path.replace(path)
+        with open_directory(path.parent, create=True):
+            fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            temp_path = Path(name)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp_path.replace(path)
     finally:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
@@ -143,27 +152,49 @@ def artifact_envelope(
     truncation_status: dict | None = None,
     limits_applied: dict | None = None,
 ) -> dict:
+    grant = current_grant()
+    provenance = {"policy_fingerprint": grant.fingerprint, "campaign_scope_binding_id": grant.binding_id} if grant and grant.campaign_id == campaign_id else {}
     return {
+        **provenance,
         "artifact_uuid": str(uuid.uuid4()),
         "campaign_id": campaign_id,
-        "tool": tool,
+        "tool": redact_text(tool),
         "tool_version": __version__,
         "project_version": __version__,
         "created_at": iso_now(),
         "scope_snapshot_sha256": scope_snapshot_sha256(campaign_id),
-        "parent_artifact_ids": parent_artifact_ids or [],
-        "input_artifact_ids": input_artifact_ids or [],
-        "truncation_status": truncation_status or {"truncated": False},
-        "configuration_limits_applied": limits_applied or {},
+        "parent_artifact_ids": redact_structure(parent_artifact_ids or []),
+        "input_artifact_ids": redact_structure(input_artifact_ids or []),
+        "truncation_status": redact_structure(truncation_status or {"truncated": False}),
+        "configuration_limits_applied": redact_structure(limits_applied or {}),
         "payload": payload,
     }
 
 
 def write_json_artifact(path: Path, envelope: dict) -> dict:
     final = json.dumps(envelope, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    atomic_write_bytes(path, final)
-    digest = sha256_bytes(final)
-    return _write_integrity_metadata(path, envelope, digest)
+    return _write_artifact_pair(path, final, envelope)
+
+
+def _write_artifact_pair(path: Path, data: bytes, envelope: dict, *, maximum: int | None = None) -> dict:
+    """Publish an artifact pair with durable interrupted-update detection."""
+    maximum = maximum if maximum is not None else limit("max_saved_artifact_bytes")
+    if len(data) > maximum:
+        raise SafeIOError(f"Artifact exceeds configured maximum of {maximum} bytes.")
+    with campaign_storage_lock():
+        path = safe_campaign_path(envelope["campaign_id"], path.absolute(), must_exist=False)
+        if any(redact_text(part) != part for part in path.parts):
+            raise SafeIOError("Artifact path contains ambiguous or sensitive text.")
+        marker = path.with_name("." + path.name + ARTIFACT_PENDING_SUFFIX)
+        atomic_write_bytes(marker, b"Artifact update in progress.\n", maximum=1024)
+        with open_directory(path.parent) as directory:
+            os.fsync(directory)
+            atomic_write_bytes(path, data, maximum=maximum)
+            result = _write_integrity_metadata(path, envelope, sha256_bytes(data))
+            os.fsync(directory)
+            os.unlink(marker.name, dir_fd=directory)
+            os.fsync(directory)
+            return result
 
 
 def _write_integrity_metadata(path: Path, envelope: dict, digest: str) -> dict:
@@ -183,19 +214,23 @@ def _write_integrity_metadata(path: Path, envelope: dict, digest: str) -> dict:
         "truncation_status": envelope.get("truncation_status", {}),
         "configuration_limits_applied": envelope.get("configuration_limits_applied", {}),
     }
-    atomic_write_bytes(metadata_path, json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8") + b"\n")
+    for key in ("policy_fingerprint", "campaign_scope_binding_id"):
+        if key in envelope:
+            metadata[key] = envelope[key]
+    atomic_write_bytes(metadata_path, json.dumps(redact_structure(metadata), indent=2, sort_keys=True).encode("utf-8") + b"\n")
     return {"path": str(path), "metadata_path": str(metadata_path), "artifact_uuid": envelope["artifact_uuid"], "sha256": digest}
 
 
 def write_flat_json_artifact(campaign_id: str, tool: str, path: Path, payload: dict, *, truncation_status: dict | None = None, limits_applied: dict | None = None) -> dict:
     """Write provenance alongside an established top-level JSON payload shape."""
-    envelope = artifact_envelope(campaign_id, tool, payload, truncation_status=truncation_status, limits_applied=limits_applied)
-    flattened = {**payload, **{key: value for key, value in envelope.items() if key != "payload"}}
-    return write_json_artifact(path, flattened)
+    with campaign_storage_lock():
+        envelope = artifact_envelope(campaign_id, tool, payload, truncation_status=truncation_status, limits_applied=limits_applied)
+        flattened = {**payload, **{key: value for key, value in envelope.items() if key != "payload"}}
+        return write_json_artifact(path, flattened)
 
 
 def write_artifact_bytes(campaign_id: str, tool: str, path: Path, data: bytes, *, maximum: int | None = None, truncation_status: dict | None = None, limits_applied: dict | None = None) -> dict:
     """Atomically write arbitrary final artifact bytes and a provenance sidecar."""
-    envelope = artifact_envelope(campaign_id, tool, None, truncation_status=truncation_status, limits_applied=limits_applied)
-    atomic_write_bytes(path, data, maximum=maximum)
-    return _write_integrity_metadata(path, envelope, sha256_bytes(data))
+    with campaign_storage_lock():
+        envelope = artifact_envelope(campaign_id, tool, None, truncation_status=truncation_status, limits_applied=limits_applied)
+        return _write_artifact_pair(path, data, envelope, maximum=maximum)

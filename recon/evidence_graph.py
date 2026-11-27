@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign_paths, iso_now
 from recon.safeio import SafeIOError, read_bytes_bounded, safe_campaign_path, write_artifact_bytes
@@ -70,6 +71,7 @@ def _fingerprint(node_type: str, normalized_value: str, source_artifact_path: st
     return hashlib.sha256(data).hexdigest()
 
 
+@campaign_operation
 def add_evidence_batch(campaign_id: str, tool: str, nodes: list[dict], edges: list[dict] | None = None) -> dict:
     """Upsert deterministic nodes and edges while retaining observation timestamps."""
     try:
@@ -127,6 +129,7 @@ def add_evidence_batch(campaign_id: str, tool: str, nodes: list[dict], edges: li
     return {"ok": True, "path": path, "nodes_added": added, "nodes_observed": updated, "edges_added": edge_added, "node_ids": aliases}
 
 
+@campaign_operation
 def get_evidence_graph_summary(campaign_id: str) -> dict:
     try:
         graph = _load(campaign_id)
@@ -143,6 +146,7 @@ def get_evidence_graph_summary(campaign_id: str) -> dict:
     return {"ok": True, "campaign_id": campaign_id, "schema_version": graph["schema_version"], "node_count": len(graph["nodes"]), "edge_count": len(graph["edges"]), "nodes_by_type": counts, "edges_by_type": edge_counts}
 
 
+@campaign_operation
 def query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit: int = 100) -> dict:
     depth = max(0, min(int(depth), 3))
     maximum = max(1, min(int(limit), 500))
@@ -178,6 +182,7 @@ def query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit
     return {"ok": True, "node_uuid": node_uuid, "nodes": nodes, "edges": edges, "truncated": truncated}
 
 
+@campaign_operation
 def import_dirfuzz_evidence_for_campaign(campaign_id: str, analysis_path: str | None = None) -> dict:
     paths = get_campaign_paths(campaign_id)
     if not paths.get("ok"):

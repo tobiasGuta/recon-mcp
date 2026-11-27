@@ -428,5 +428,6 @@ def test_resolve_scope_target_mcp_interop_format(tmp_path, monkeypatch):
     result = resolve_scope_target("api.example.com", format="mcp_interop")
 
     assert result["mcp_interop"]["scope_ok"] is True
-    assert result["mcp_interop"]["can_scan"] is True
+    assert result["mcp_interop"]["can_scan"] is False
+    assert result["mcp_interop"]["can_test"] is False
     assert result["mcp_interop"]["recommended_bugmap_target_label"] == "api.example.com"

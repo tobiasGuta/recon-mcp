@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Pattern
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths
 from recon.evidence_graph import add_evidence_batch
@@ -93,6 +94,7 @@ def _location(text: str, offset: int) -> tuple[int, int]:
     return line, offset - last
 
 
+@campaign_operation
 def scan_sensitive_artifacts_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
     """Scan approved campaign-local text without exposing or validating candidates."""
     paths = get_campaign_paths(campaign_id)

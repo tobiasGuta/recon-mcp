@@ -101,7 +101,7 @@ def test_configurable_user_agent_is_applied(monkeypatch):
     monkeypatch.setattr("recon.http_fetch.time.sleep", lambda _: None)
     monkeypatch.setattr(
         "recon.http_fetch.httpx.Client",
-        lambda **kwargs: original_client(transport=httpx.MockTransport(handler), **kwargs),
+        lambda **kwargs: original_client(**{**kwargs, "transport": httpx.MockTransport(handler)}),
     )
 
     result = fetch_headers("https://example.com/")
@@ -356,7 +356,7 @@ def test_safe_request_checks_redirect_resolved_ip_before_following(monkeypatch):
             return ["10.0.0.5"]
         return ["93.184.216.34"]
 
-    patch_scope(monkeypatch)
+    patch_scope(monkeypatch, allowed_domains=["example.com", "sub.example.com"])
     monkeypatch.setattr("recon.http_fetch.resolve_host_ips", resolve)
     monkeypatch.setattr("recon.http_fetch._client", client)
 

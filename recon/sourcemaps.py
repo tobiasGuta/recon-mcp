@@ -10,13 +10,16 @@ from urllib.parse import urlsplit
 import httpx
 
 from recon import http_fetch
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
+from recon.authorization import evaluate, load_policy, parse_target, policy_failure, safe_target
+from recon.campaign_scope import campaign_network
 from recon.campaigns import file_timestamp, get_campaign_paths, slugify
 from recon.endpoint_scoring import score_endpoints
-from recon.js_analysis import extract_endpoints_from_js, parse_sourcemap_references
+from recon.js_analysis import extract_endpoints_from_js, get_max_requests_per_tool_call, parse_sourcemap_references
 from recon.memory import record_negative_result
 from recon.safeio import SafeIOError, atomic_write_bytes, limit, read_text_bounded, write_artifact_bytes, write_flat_json_artifact
-from recon.scope import ScopeError, resolve_scope_target
+from recon.scope import ScopeError
 
 
 MAX_SOURCEMAP_BYTES = 5 * 1024 * 1024
@@ -81,7 +84,7 @@ def _sourcemap_dirs(campaign_id: str) -> dict:
         if error:
             return {"ok": False, "error": error}
     try:
-        sourcemaps_root.mkdir(parents=True, exist_ok=True)
+        sourcemaps_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         maps_dir = sourcemaps_root / "maps"
         extracted_dir = sourcemaps_root / "extracted"
         analysis_dir = sourcemaps_root / "analysis"
@@ -93,7 +96,7 @@ def _sourcemap_dirs(campaign_id: str) -> dict:
             error = _reject_symlink(path, label)
             if error:
                 return {"ok": False, "error": error}
-            path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         return {"ok": False, "error": f"Could not create source map directories: {exc}"}
     return {
@@ -126,88 +129,100 @@ def detect_sourcemap_references(js_text: str, js_url: str | None = None) -> dict
     """Detect sourceMappingURL references without downloading anything."""
     references = parse_sourcemap_references(js_text or "", js_url=js_url)
     warnings = ["Source map references require manual review; no vulnerability is implied."] if references else []
-    return {"ok": True, "js_url": js_url, "references": references, "count": len(references), "warnings": warnings}
+    return {"ok": True, "js_url": safe_target(js_url) if js_url else None, "references": references, "count": len(references), "warnings": warnings}
 
 
+@campaign_network("js_url")
 def detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str) -> dict:
-    """Fetch JS safely, detect source map references, and save campaign analysis."""
+    """Fetch a JS URL and save its redacted map references."""
+    return _detect_campaign_references(campaign_id, js_url, {})
+
+
+def _detect_campaign_references(campaign_id: str, js_url: str, downloads: dict[int, str]) -> dict:
     dirs = _sourcemap_dirs(campaign_id)
     if not dirs.get("ok"):
         return dirs
+    display_url = safe_target(js_url)
     try:
-        js_text = http_fetch.safe_get_text(js_url)
+        js_text, response = http_fetch.safe_get_text_with_response(js_url)
+        policy = load_policy()
     except http_fetch.BoundedReadError as exc:
-        result = {**exc.as_result(js_url), "campaign_id": campaign_id, "js_url": js_url}
-        write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=js_url, ok=False, warnings=[result["error"]], metadata={"configured_maximum_bytes": exc.maximum, "bytes_observed": exc.observed, "rejected": True})
+        result = {**exc.as_result(js_url), "campaign_id": campaign_id, "js_url": display_url}
+        write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=display_url, ok=False, warnings=[result["error"]])
         return result
-    except (ScopeError, httpx.HTTPError) as exc:
-        result = {"ok": False, "campaign_id": campaign_id, "js_url": js_url, "error": f"Could not fetch JavaScript safely: {exc}"}
-        write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=js_url, ok=False, warnings=[result["error"]])
+    except (ScopeError, OSError, httpx.HTTPError) as exc:
+        failure = getattr(exc, "decision", None) or policy_failure(exc)
+        result = {"ok": False, "campaign_id": campaign_id, "js_url": display_url, "error": failure["reason"], "scope_decision": failure}
+        write_audit_event(campaign_id, "detect_sourcemap_references_for_campaign", target=display_url, ok=False, scope_decision=failure)
         return result
 
-    detection = detect_sourcemap_references(js_text, js_url=js_url)
+    scope_decision = response.extensions["scope_decision"]
+    request_urls = {}
+    references = parse_sourcemap_references(js_text, js_url=str(response.url), request_urls=request_urls)
     downloadable = []
     skipped = []
-    for reference in detection["references"]:
-        resolved_url = reference.get("resolved_url")
-        if not resolved_url:
-            skipped.append({**reference, "skip_reason": "No resolved URL to scope-check or download."})
+    for index, reference in enumerate(references):
+        if index not in request_urls:
+            skipped.append({**reference, "skip_reason": "No safely resolved URL to evaluate."})
             continue
-        scope_decision = resolve_scope_target(resolved_url)
-        item = {**reference, "scope_decision": scope_decision}
-        if reference.get("safe_to_download") and scope_decision.get("in_scope"):
+        target = parse_target(request_urls[index])
+        map_decision = evaluate(policy, target, expected_fingerprint=scope_decision["policy_fingerprint"])
+        item = {**reference, "scope_decision": map_decision}
+        if map_decision["authorized"]:
+            downloads[index] = target.url
             downloadable.append(item)
         else:
-            skipped.append({**item, "skip_reason": scope_decision.get("reason") or "Source map is not safe to download."})
+            skipped.append({**item, "skip_reason": map_decision["reason"]})
 
-    warnings = list(detection["warnings"])
+    warnings = ["Source map references are leads and require manual scope validation."]
     payload = {
         "ok": True,
         "campaign_id": campaign_id,
-        "js_url": js_url,
-        "references": detection["references"],
+        "js_url": display_url,
+        "references": references,
+        "scope_decision": scope_decision,
         "downloadable": downloadable,
         "skipped": skipped,
         "warnings": warnings,
     }
-    path = _analysis_path(dirs, f"{_safe_label(js_url)}-sourcemap-detect")
+    path = _analysis_path(dirs, f"{_safe_label(display_url)}-sourcemap-detect")
     save = _write_json(path, payload)
     if not save.get("ok"):
         return save
     write_audit_event(
         campaign_id,
         "detect_sourcemap_references_for_campaign",
-        target=js_url,
+        target=display_url,
         ok=True,
+        scope_decision=scope_decision,
         result_path=str(path),
         warnings=warnings,
-        metadata={"detected_count": len(detection["references"]), "downloadable_count": len(downloadable)},
+        metadata={"detected_count": len(references), "downloadable_count": len(downloadable)},
     )
     return {**payload, "path": str(path)}
 
 
+@campaign_network("sourcemap_url")
 def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dict:
-    """Download one in-scope source map using Recon MCP's safe HTTP path."""
+    """Download one authorized source map using the shared HTTP transport."""
     dirs = _sourcemap_dirs(campaign_id)
     if not dirs.get("ok"):
         return dirs
-    scope_decision = resolve_scope_target(sourcemap_url)
-    if not scope_decision.get("in_scope"):
-        result = {"ok": False, "campaign_id": campaign_id, "sourcemap_url": sourcemap_url, "error": "Source map URL is out of scope.", "scope_decision": scope_decision}
-        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]])
-        return result
-
+    display_url = safe_target(sourcemap_url)
     try:
         content, response = http_fetch.safe_get_bytes(sourcemap_url, limit("max_sourcemap_bytes"), content_type="source map")
     except http_fetch.BoundedReadError as exc:
-        result = {**exc.as_result(sourcemap_url), "campaign_id": campaign_id, "sourcemap_url": sourcemap_url, "scope_decision": scope_decision}
-        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]], metadata={"configured_maximum_bytes": exc.maximum, "bytes_observed": exc.observed, "rejected": True})
+        result = {**exc.as_result(sourcemap_url), "campaign_id": campaign_id, "sourcemap_url": display_url}
+        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=display_url, ok=False, warnings=[result["error"]])
         return result
     except (ScopeError, httpx.HTTPError) as exc:
-        result = {"ok": False, "campaign_id": campaign_id, "sourcemap_url": sourcemap_url, "error": f"Could not download source map safely: {exc}", "scope_decision": scope_decision}
-        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=False, scope_decision=scope_decision, warnings=[result["error"]])
+        failure = getattr(exc, "decision", None)
+        reason = str(exc) if isinstance(exc, ScopeError) else "HTTP request failed."
+        result = {"ok": False, "campaign_id": campaign_id, "sourcemap_url": display_url, "error": reason, "scope_decision": failure}
+        write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=display_url, ok=False, scope_decision=failure, warnings=[reason])
         return result
 
+    scope_decision = response.extensions["scope_decision"]
     try:
         sourcemap = json.loads(content.decode(response.encoding or "utf-8", errors="replace"))
     except json.JSONDecodeError as exc:
@@ -215,7 +230,7 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
     if not isinstance(sourcemap, dict) or "version" not in sourcemap or not (sourcemap.get("sources") or sourcemap.get("sections")):
         return _error("Downloaded JSON does not look like a source map.")
 
-    label = _safe_label(sourcemap_url)
+    label = _safe_label(display_url)
     map_path = dirs["maps"] / f"{file_timestamp()}-{label}.map"
     metadata_path = _analysis_path(dirs, f"{label}-download")
     try:
@@ -227,7 +242,7 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
     metadata = {
         "ok": True,
         "campaign_id": campaign_id,
-        "sourcemap_url": sourcemap_url,
+        "sourcemap_url": display_url,
         "map_path": str(map_path),
         "size_bytes": len(content),
         "sources_count": len(sources),
@@ -238,7 +253,7 @@ def download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str) -> dic
     save = _write_json(metadata_path, metadata)
     if not save.get("ok"):
         return save
-    write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=sourcemap_url, ok=True, scope_decision=scope_decision, result_path=str(map_path))
+    write_audit_event(campaign_id, "download_sourcemap_for_campaign", target=display_url, ok=True, scope_decision=scope_decision, result_path=str(map_path))
     return {**metadata, "artifact_uuid": map_saved["artifact_uuid"], "artifact_sha256": map_saved["sha256"], "integrity_metadata_path": map_saved["metadata_path"], "metadata_path": str(metadata_path)}
 
 
@@ -296,6 +311,7 @@ def _safe_source_path(raw_source: str, index: int, used: set[str]) -> tuple[Path
     return candidate, warning
 
 
+@campaign_operation
 def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> dict:
     """Extract embedded sourcesContent from a campaign-stored source map."""
     dirs = _sourcemap_dirs(campaign_id)
@@ -345,7 +361,7 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
     if extracted_dir.exists() and extracted_dir.is_symlink():
         return _error("Extracted directory must not be a symlink.")
     try:
-        extracted_dir.mkdir(parents=True, exist_ok=True)
+        extracted_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         return _error(f"Could not create extracted directory: {exc}")
 
@@ -367,7 +383,6 @@ def extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str) -> d
             sources_without_content += 1
             continue
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_bytes(destination, str(content).encode("utf-8", errors="replace"), maximum=max_total_bytes)
             files_written += 1
         except OSError as exc:
@@ -421,6 +436,7 @@ def _redact_preview(line: str) -> str:
     return preview[:220]
 
 
+@campaign_operation
 def analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None) -> dict:
     """Analyze extracted source map files for endpoint and manual-review leads."""
     dirs = _sourcemap_dirs(campaign_id)
@@ -500,17 +516,20 @@ def analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str 
     return {**payload, "path": str(path)}
 
 
+@campaign_network("js_url")
 def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
     """Run safe detect, download, extract, and analyze steps for one JS URL."""
-    detection = detect_sourcemap_references_for_campaign(campaign_id, js_url)
+    request_urls: dict[int, str] = {}
+    detection = _detect_campaign_references(campaign_id, js_url, request_urls)
+    display_url = safe_target(js_url)
     if not detection.get("ok"):
         return detection
     if not detection.get("references"):
-        record_negative_result(campaign_id, js_url, "sourcemap_discovery", "No source map reference found.")
+        record_negative_result(campaign_id, display_url, "sourcemap_discovery", "No source map reference found.")
         return {
             "ok": True,
             "campaign_id": campaign_id,
-            "js_url": js_url,
+            "js_url": display_url,
             "detected_count": 0,
             "message": "No source map reference found.",
             "suggest_record_negative_result": True,
@@ -521,8 +540,11 @@ def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
     extractions = []
     analyzed_dirs = []
     warnings = list(detection.get("warnings", []))
-    for reference in detection.get("downloadable", []):
-        download = download_sourcemap_for_campaign(campaign_id, reference["resolved_url"])
+    budget = get_max_requests_per_tool_call() - 1
+    if len(request_urls) > budget:
+        warnings.append("Source-map downloads truncated at the configured request budget.")
+    for request_url in list(request_urls.values())[:budget]:
+        download = download_sourcemap_for_campaign(campaign_id, request_url)
         if download.get("ok"):
             downloads.append(download)
             extraction = extract_sourcemap_sources_for_campaign(campaign_id, download["map_path"])
@@ -539,7 +561,7 @@ def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
     summary = {
         "ok": True,
         "campaign_id": campaign_id,
-        "js_url": js_url,
+        "js_url": display_url,
         "detected_count": len(detection.get("references", [])),
         "downloaded_count": len(downloads),
         "extracted_count": len(extractions),
@@ -552,7 +574,7 @@ def sourcemap_workflow_for_campaign(campaign_id: str, js_url: str) -> dict:
         "analysis_path": analysis.get("path"),
         "warnings": warnings,
     }
-    write_audit_event(campaign_id, "sourcemap_workflow_for_campaign", target=js_url, ok=True, result_path=analysis.get("path"), warnings=warnings)
+    write_audit_event(campaign_id, "sourcemap_workflow_for_campaign", target=display_url, ok=True, result_path=analysis.get("path"), warnings=warnings)
     return summary
 
 

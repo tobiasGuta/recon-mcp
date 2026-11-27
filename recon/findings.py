@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths, iso_now, slugify
 from recon.redaction import redact_structure
@@ -121,6 +122,7 @@ def _history_entry(action: str, from_status: str | None, to_status: str, reason:
     }
 
 
+@campaign_operation
 def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
     """Create a possible issue in the hallucination bin for manual validation."""
     if not isinstance(finding, dict):
@@ -167,6 +169,7 @@ def create_finding_candidate(campaign_id: str, finding: dict) -> dict:
     return {"ok": True, "finding": candidate, "path": str(path), "warnings": audit.get("warnings", []) if not audit.get("ok") else []}
 
 
+@campaign_operation
 def get_finding(campaign_id: str, finding_id: str) -> dict:
     """Load one finding candidate from any status folder."""
     path, _, error = _find_existing_file(campaign_id, finding_id)
@@ -180,6 +183,7 @@ def get_finding(campaign_id: str, finding_id: str) -> dict:
     return {"ok": True, "finding": finding, "path": str(path)}
 
 
+@campaign_operation
 def list_findings(campaign_id: str, status: str | None = None) -> dict:
     """List findings, optionally filtered by status."""
     if status is not None and status not in ALLOWED_STATUSES:
@@ -262,21 +266,25 @@ def _transition(
     return {"ok": True, "finding": finding, "path": str(destination), "warnings": audit.get("warnings", []) if not audit.get("ok") else []}
 
 
+@campaign_operation
 def promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None) -> dict:
     """Promote a finding one allowed step after human validation."""
     return _transition(campaign_id, finding_id, target_status, reason, action="promote", gate_updates=gate_updates)
 
 
+@campaign_operation
 def demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str) -> dict:
     """Demote a finding one allowed step for safer manual review."""
     return _transition(campaign_id, finding_id, target_status, reason, action="demote")
 
 
+@campaign_operation
 def reject_finding(campaign_id: str, finding_id: str, reason: str) -> dict:
     """Reject a candidate from any status with a required reason."""
     return _transition(campaign_id, finding_id, REJECTED, reason, action="reject")
 
 
+@campaign_operation
 def update_finding_gates(campaign_id: str, finding_id: str, gate_updates: dict, reason: str) -> dict:
     """Update promotion gates without changing the current finding status."""
     path, current_status, error = _find_existing_file(campaign_id, finding_id)

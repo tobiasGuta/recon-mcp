@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import get_campaign, get_campaign_paths
 from recon.endpoint_scoring import score_endpoints
@@ -103,6 +104,7 @@ def _audit_tools(paths: dict) -> list[str]:
     return sorted(set(tools))
 
 
+@campaign_operation
 def generate_campaign_markdown_summary(campaign_id: str) -> dict:
     """Generate a campaign summary for authorized, human-led testing only."""
     campaign = get_campaign(campaign_id)
@@ -218,6 +220,7 @@ Directory fuzzing remains delegated to the separate Go DirFuzz MCP server.
     return {"ok": True, "path": str(path), "metadata_path": saved["metadata_path"], "artifact_uuid": saved["artifact_uuid"], "summary": content, "warnings": audit.get("warnings", []) if not audit.get("ok") else []}
 
 
+@campaign_operation
 def generate_report_candidate_markdown(campaign_id: str, finding_id: str) -> dict:
     """Generate a local report-candidate Markdown file; it is not submitted anywhere."""
     result = get_finding(campaign_id, finding_id)

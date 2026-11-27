@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from recon.campaign_lock import campaign_operation
 from recon.audit import write_audit_event
 from recon.campaigns import file_timestamp, get_campaign_paths
 from recon.safeio import SafeIOError, artifact_envelope, limit, read_bytes_bounded, write_artifact_bytes, write_json_artifact
@@ -101,6 +102,7 @@ def _collect(campaign_id: str) -> dict[str, dict[str, dict]]:
     return categories
 
 
+@campaign_operation
 def compare_campaign_recon(campaign_id: str, baseline_campaign_id: str) -> dict:
     try:
         current = _collect(campaign_id)
