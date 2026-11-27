@@ -1,466 +1,141 @@
-# recon-mcp
+# Recon MCP
 
-`recon-mcp` is a local Python MCP server for authorized, low-risk, human-led bug bounty recon. It provides lightweight helpers for scope checks, headers, robots.txt, sitemap.xml, JavaScript URL collection, endpoint extraction, URL deduplication, evidence notes, manual test planning, and campaign-based recon organization.
+[![Stable release v0.2.0](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/tobiasGuta/recon-mcp/releases/tag/v0.2.0)
+[![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-This project complements a separate Go DirFuzz MCP server. It does not implement directory fuzzing in Python. For scope, it can use local JSON snapshots written by H1-Scope-Watcher as the source of truth.
+Recon MCP is a local Model Context Protocol server for authorized, human-led reconnaissance and security evidence management. It gives application security engineers, developers, students, and bug bounty researchers a way to check scope, review artifacts, and organize observations through a compatible AI client.
 
-## Safety Model
+- **Check scope before any request.** Evaluate complete URLs against reviewed manual rules, a local HackerOne snapshot, or a supported subset of Burp Advanced Scope.
+- **Collect bounded HTTP observations.** Review headers, robots directives, sitemaps, and script references using read-only requests.
+- **Analyze existing material.** Inspect local JavaScript, source maps, and API contract signals. Import summaries of existing HAR, Burp XML, or DirFuzz evidence.
+- **Organize research.** Use campaigns to keep scope decisions, artifacts, provenance, negative results, and finding candidates together. Review passive discovery and comparison results as leads.
+- **Prepare local reports.** Track manual validation and draft Markdown summaries for human review.
 
-This server is designed for authorized, low-risk security testing only. Every network-facing Python tool uses the active policy to check the actual outbound URL before DNS and dispatch, including each redirect and fallback. HTTP behavior is read-only, uses timeouts and small request delays, and avoids custom attack payloads.
+Recon MCP has a deliberately narrow role. Vulnerability scanning, directory brute forcing, credential testing, autonomous exploitation, and general-purpose agent execution are outside its toolset.
 
-Recon MCP validates the full DNS answer set and connects to a checked numeric address. Each request opens a fresh connection while keeping the authorized hostname for HTTP Host, TLS SNI, and certificate verification. See [Scope authorization](docs/scope-authorization.md) for the transport boundary and residual limitations.
+<a name="installation"></a>
 
-Sitemap XML parsing uses `defusedxml` so unsafe XML constructs are rejected safely instead of being parsed by the standard library XML parser.
+## Quick start
 
-It does not exploit vulnerabilities, bypass authentication, brute-force accounts, create accounts, perform login testing, send destructive requests, run high-volume scans, or scan outside configured scope. DNS resolved-IP checks and hardened XML parsing are defensive controls for authorized recon, not bypass or exploitation features.
+1. On the qualified Fedora platform, follow the [stable installation](docs/installation.md#qualified-stable-fedora-installation). Contributors can use a separate [editable checkout](docs/installation.md#development-installation).
+2. Register the local STDIO server using the [client setup guide](docs/client-setup.md).
+3. Call `health` with `{}`. The stable release reports `ok: true`, `version: "0.2.0"`, and 67 available server tools. With no policy installed, the server runs with empty, deny-all scope.
+4. Follow the [offline tutorial](docs/getting-started.md) to evaluate an allowed and a denied synthetic URL without DNS or HTTP.
 
-Directory fuzzing belongs in the separate Go DirFuzz MCP server, with tools such as `dirfuzz_scan`, `dirfuzz_scan_status`, `dirfuzz_cancel`, `dirfuzz_analyze`, `dirfuzz_list_scope`, and `dirfuzz_build_scan`.
+## Architecture
 
-## Campaign Workflow
-
-Campaigns organize scoped recon artifacts, finding candidates, evidence, memory, and reports under `output/campaigns/<campaign_id>/`. Creating a campaign checks configured scope first and fails closed when the target is not authorized.
-
-Each campaign stores:
-
-```text
-output/campaigns/<campaign_id>/
-  campaign.json
-  scope.json
-  audit.jsonl
-  recon/
-  findings/
-  evidence/
-  memory/
-  reports/
+```mermaid
+flowchart LR
+    Human["Operator and human review"] --> Client["MCP-compatible client"]
+    Client -->|Starts stable process| Guard["Guarded launcher"]
+    Guard -->|Verifies and starts| Server["Recon MCP server"]
+    Client <-->|STDIO| Server
+    Server --> Policy["Local authorization policy"]
+    Server --> Network["Scoped DNS and verified read-only HTTP"]
+    Network -->|Checks actual request URL| Policy
+    Server --> Analysis["Local analysis tools"]
+    Server --> Storage["Private campaign storage"]
+    Analysis --> Storage
 ```
 
-Campaign-aware tools save JSON artifacts into the matching `recon/` subfolder and append events to `audit.jsonl`. A bounded storage-wide lock coordinates threads and processes on supported local Linux filesystems. Network operations require a current policy binding. Legacy campaigns and campaigns with a changed policy require [local reauthorization](docs/scope-authorization.md#campaign-reauthorization).
+The launcher applies to stable deployments. Client prompts, tool approvals, and hosted data handling belong to the client. See [Security design](docs/security-design.md).
 
-Recommended campaign flow:
+## Documentation
 
-1. `create_campaign`
-2. `fetch_headers_for_campaign`
-3. `fetch_robots_for_campaign`
-4. `fetch_sitemap_for_campaign`
-5. `collect_js_urls_for_campaign`
-6. `extract_endpoints_for_campaign`
-7. `scan_sensitive_artifacts_for_campaign` and `extract_api_contracts_for_campaign`
-8. `get_evidence_graph_summary` and a bounded `query_evidence_graph` when useful
-9. Optionally run passive subdomain discovery; DNS resolution remains off by default
-10. `score_endpoints`
-11. `create_finding_candidate`
-12. `promote_finding` only after manual validation
-13. `create_campaign_evidence_note`
-14. `generate_campaign_summary` and `verify_campaign_artifacts`
-15. `generate_report_candidate_markdown`
+| I want to | Guide |
+| --- | --- |
+| Install and run an offline diagnostic | [Getting started](docs/getting-started.md) · [Installation](docs/installation.md) |
+| Connect Codex, Antigravity, Gemini CLI, or a generic client | [Client setup](docs/client-setup.md) |
+| Review, test, or replace a scope policy | [Scope authorization](docs/scope-authorization.md) |
+| Find a tool and understand its effects | [Tool reference](docs/tool-reference.md) |
+| Organize campaigns, evidence, and reports | [Campaigns](docs/campaigns.md) · [Workflows](docs/workflows.md) · [Evidence management](docs/evidence-management.md) |
+| Bring in output from another tool | [Integrations](docs/integrations.md) |
+| Diagnose errors or maintain a stable deployment | [Troubleshooting](docs/troubleshooting.md) · [Deployment](docs/deployment.md) |
+| Check release evidence or contribute | [Documentation index](docs/README.md) · [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) |
 
-`generate_campaign_summary` writes `reports/summary.md`, and `generate_manual_test_plan_for_campaign` writes `reports/manual_test_plan.md`. Reports are local Markdown files only; nothing is auto-submitted anywhere.
+## Compatibility and security boundaries
 
-## Campaign Cleanup
+The v0.2.0 release was independently qualified on Fedora Linux 45 x86_64 with GIL-enabled CPython 3.15.2, direct MCP STDIO, and an offline Codex CLI 0.171.0 session with no model turn. Antigravity connectivity, 67-tool discovery, and offline diagnostics were operator-reported. Standalone Gemini CLI configuration is documented and unverified. See the [compatibility matrix](docs/compatibility.md) for the filesystem and client evidence.
 
-Campaign cleanup is archive-first. `archive_campaign` moves a campaign from `output/campaigns/` to `output/archived_campaigns/` and marks its metadata as archived. This preserves evidence, findings, reports, and audit logs while keeping active campaign lists tidy.
+Recon MCP defaults to deny and checks the actual URL of each network request, redirect, and fallback. Public DNS answers are checked before a connection to a validated numeric address. The authorized hostname is retained for TLS verification. Credential-like and ambiguous URLs are rejected before DNS, and recognizable credentials are redacted in supported diagnostics. Raw evidence can still contain sensitive data. The operator confirms real-world permission, reviews tool results, and decides whether a finding is ready to report. [Scope authorization](docs/scope-authorization.md) · [Security design](docs/security-design.md)
 
-Active campaigns are not directly deleted by MCP for safety. Permanent deletion, when used, only works on archived campaigns and requires the exact campaign ID as confirmation through `delete_archived_campaign`.
+## Release
 
-## Finding Pipeline
-
-Possible issues are not vulnerabilities. Every new candidate starts in the hallucination bin at `findings/hallucinations/` with `manual_validation_required: true`.
-
-Allowed status flow:
-
-- `hallucination` to `needs_manual_validation`
-- `needs_manual_validation` to `validated`
-- `validated` to `report_candidate`
-- any status to `rejected`
-
-Report candidates require all gates to be true: scope confirmed, evidence saved, reproduced manually, impact proven, safe non-destructive testing, and report ready. The pipeline blocks direct jumps from hallucination to validated or report candidate.
-
-Negative-result memory is stored in `memory/negative_results.jsonl`. These records document useful checks that did not produce findings; they are included in summaries and manual plans, but they are not treated as vulnerabilities.
-
-The hallucination bin is intentional. It keeps AI-assisted or speculative leads separate until a human validates scope, evidence, reproducibility, impact, and safety.
-
-## Source Map Recon
-
-Source maps can reveal original frontend source files, routes, API paths, GraphQL usage, environment names, feature flags, client configuration, and source file names. These are recon leads, not vulnerabilities by themselves.
-
-Recon MCP handles source maps inside a campaign with a safe, explicit workflow:
-
-- Fetch JavaScript through the existing scope-checked HTTP helpers.
-- Detect `sourceMappingURL` references without downloading by default.
-- Resolve and scope-check every source map URL.
-- Skip out-of-scope source map URLs instead of fetching them.
-- Download only bounded, in-scope source map JSON.
-- Extract embedded `sourcesContent` locally inside the campaign folder.
-- Analyze extracted files for endpoint candidates and manual-review signals.
-- Redact likely sensitive values in previews.
-
-Recon MCP does not use unsafe remote external modes such as `sourcemapper -jsurl https://target/app.js` or `sourcemapper -url https://target/app.js.map`. External sourcemapper, if used later, must be local-file-only: it should accept only `.map` files already stored inside the campaign and write only inside the campaign extracted folder. No cookies, Authorization headers, tokens, custom auth headers, or remote URLs are passed to external tools. No reports are auto-submitted.
-
-Source map workflow:
-
-1. `create_campaign`
-2. `collect_js_urls_for_campaign`
-3. `detect_sourcemap_references_for_campaign`
-4. `download_sourcemap_for_campaign`
-5. `extract_sourcemap_sources_for_campaign`
-6. `analyze_sourcemap_sources_for_campaign`
-7. `generate_manual_test_plan_for_campaign`
-8. `create_finding_candidate` only if manual validation suggests a real issue
-9. `promote_finding` only after impact is proven
-10. `generate_campaign_summary`
-
-## Deterministic local analysis
-
-`authorization.py` compiles scope policies and evaluates complete URLs. `scope.py` also provides host inventory for evidence workflows. `http_fetch.py` handles bounded HTTP transport, redirect checks, and DNS preflight. Campaign files and audit records use `safeio.py` and `audit.py`.
-
-`scan_sensitive_artifacts_for_campaign` analyzes only approved campaign-local text. It returns minimal prefix/suffix redactions and SHA-256 fingerprints; complete candidates and surrounding source lines are never returned, persisted, logged, or placed in reports. Private-key candidates expose only their type/header, location, and fingerprint. Placeholder values are downgraded, and public client identifiers such as Stripe publishable keys, Sentry DSNs, Firebase configuration, and Google browser API keys are separate client-configuration signals. The tool never tests a credential.
-
-`extract_api_contracts_for_campaign` recognizes deterministic `fetch`, Axios, Angular `HttpClient`, `XMLHttpRequest`, WebSocket, JSON body, and named GraphQL operation patterns. Every contract declares endpoint uncertainty as `static`, `partially_dynamic`, `fully_dynamic`, or `unknown`. Its previews redact authentication-like values. Contract priority is only a manual-review order, never a vulnerability conclusion.
-
-## Evidence, passive discovery, and comparison
-
-The campaign evidence graph records normalized, redacted nodes, edges, provenance, confidence, scope decisions, and observation history. Graph summaries and neighborhood queries are bounded; the entire graph is not returned by default. `import_dirfuzz_evidence_for_campaign` adapts analysis already saved by the existing DirFuzz handoff. The stable version 1.0 schema is documented in [Security Design](docs/security-design.md).
-
-Passive discovery can disclose an authorized root domain to fixed public providers when the active policy also authorizes each provider request URL. An apex rule alone permits recording child domains as leads. With optional DNS enabled, only children whose HTTPS root URL passes current policy are resolved. The discovery tool sends no HTTP requests to discovered children.
-
-`compare_campaign_recon` compares normalized artifacts rather than timestamps or generated filenames. It produces structured JSON and Markdown for added, removed, or changed recon observations, using only detector IDs and fingerprints for secret candidates. Differences remain recon leads.
-
-## Traffic import and artifact integrity
-
-HAR and Burp XML imports accept only campaign-local files (prefer `imports/`) and never replay requests. They retain host, path, method, status, content type, parameter names, body-field names, authentication presence, cookie names, and scope decisions. Authorization values, cookies, sensitive query values, session data, and bodies are not stored. Burp XML uses hardened XML parsing.
-
-New structured artifacts carry provenance and have sibling integrity metadata whose SHA-256 is calculated from final saved bytes. `verify_campaign_artifacts` is read-only and reports verified, missing, modified, malformed, and unsupported legacy artifacts.
-
-Nuclei is intentionally not executed here. A future separate Nuclei MCP must use exact reviewed template IDs, pinned signed HTTP-only templates, strict one-target plans and limits, explicit approval, and structured result import. Tags are never the main safety boundary. `nuclei_integration_info` returns the non-executing contract.
-
-## Installation
-
-Install Python 3.11 or newer. Recon MCP requires MCP SDK 1.x (`mcp>=1.0.0,<2.0.0`). Fedora qualification used Python 3.15.2, MCP 1.30.0, HTTPX 0.29.0, and HTTPCore 1.0.9. The transport uses the Certifi CA bundle and the HTTPX 0.29.x and HTTPCore 1.0.x public transport APIs. The Fedora qualification exercised real TLS against an isolated loopback fixture.
-
-**Fedora and Linux**
-
-On Fedora, install Python and pip with `sudo dnf install python3 python3-pip`, then run from the repository root.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
-
-The TLS qualification tests require the OpenSSL CLI. On Fedora, install it with `sudo dnf install openssl` if it is missing. [Campaign storage permissions](docs/scope-authorization.md#fedora-campaign-storage) explains how to review an existing checkout created with `umask 0002`.
-
-**Windows PowerShell**
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-```
-
-If PowerShell restricts activation scripts, invoke `.\.venv\Scripts\python.exe` directly. Windows execution remains unverified. Campaign storage operations require the supported Linux lock backend. Offline scope diagnostics are available without a campaign storage lock.
-
-## Configure scope
-
-Place your reviewed policy in `config/scope.json`, which Git ignores. Choose one source, `manual`, `h1_snapshots`, or `burp_advanced`. A missing file means empty scope. Edits and revocations take effect on the next policy read.
-
-```bash
-.venv/bin/python -m recon.scope_cli validate --config config/scope.example.json
-.venv/bin/python -m recon.scope_cli check https://api.example.com/ --config config/scope.example.json
-```
-
-The [scope authorization guide](docs/scope-authorization.md) covers URL restrictions, Burp examples, H1 eligibility and freshness, offline migration checks, and campaign reauthorization.
-
-Request hygiene settings:
-
-- `user_agent` sets the User-Agent used by read-only HTTP helpers. The default is `ReconMCP/0.2`.
-- `request_delay_ms` adds a small delay before network requests. The default is `500`.
-- `max_requests_per_tool_call` caps collection helpers that can discover many request targets. The default is `20`.
-- `check_scope_batch` accepts up to 200 hosts or URLs per call.
-- `fetch_headers_method` defaults to `HEAD`. If `HEAD` is blocked or fails before useful headers are available, `fetch_headers` falls back to a safe `GET` that requests only the first byte and still checks scope before every redirect hop.
-- `max_html_bytes`, `max_javascript_bytes`, `max_sourcemap_bytes`, `max_sitemap_bytes`, and `max_robots_bytes` stop streamed reads as soon as a limit is exceeded.
-- `max_saved_artifact_bytes`, `max_extracted_source_files`, `max_total_extracted_source_bytes`, `max_analysis_signals`, and `max_endpoint_candidates` bound local artifacts and analysis output. Invalid or unreasonable integer values reject the configuration.
-
-## H1-Scope-Watcher Snapshots
-
-This project does not call any bug bounty platform API directly. H1-Scope-Watcher should fetch program scope and write plain JSON snapshots to disk.
-
-When running H1-Scope-Watcher in Docker on Windows, use a bind mount so snapshots are visible on the host:
-
-```yaml
-volumes:
-  - ./config.yaml:/app/config.yaml:ro
-  - ./snapshots:/app/snapshots
-```
-
-That creates local JSON files such as:
-
-```text
-D:/Tools/H1-Scope-Watcher/snapshots/program_handle.json
-```
-
-Point `h1_snapshot_dir` at that folder. Do not point Recon MCP at H1-Scope-Watcher `config.yaml`, `.env`, or any file containing API tokens.
-
-## Use Recon MCP from a CLI or MCP Client
-
-Recon MCP is a local **stdio** server. Normally, your CLI or desktop client starts
-`server.py` for you and communicates with it over standard input/output. Use
-absolute paths so the client starts the intended Python environment even when the
-virtual environment is not activated in that client's shell.
-
-Before connecting a client, complete the installation steps above and create your
-authorized `config/scope.json`.
-
-### Codex CLI
-
-Add Recon MCP to Codex on Windows PowerShell:
-
-```powershell
-codex mcp add recon -- D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
-```
-
-On macOS or Linux, replace both paths with absolute paths on your machine:
-
-```bash
-codex mcp add recon -- /absolute/path/recon-mcp/.venv/bin/python /absolute/path/recon-mcp/server.py
-```
-
-Check that Codex saved the server correctly:
-
-```powershell
-codex mcp list
-codex mcp get recon
-```
-
-Start an interactive Codex session in the repository, then use `/mcp` to inspect
-the connected server:
-
-```powershell
-codex -C D:/Tools/recon-mcp
-```
-
-A safe first prompt is:
-
-```text
-Use the recon health and list_loaded_scope tools. Do not make network requests.
-```
-
-You can also run a one-shot Codex command:
-
-```powershell
-codex -C D:/Tools/recon-mcp "Use the recon health tool and summarize the server status."
-```
-
-To replace or remove this registration:
-
-```powershell
-codex mcp remove recon
-codex mcp add recon -- D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
-```
-
-Run `codex mcp --help` for the commands supported by your installed Codex version.
-See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/)
-for current CLI, IDE extension, and desktop-app instructions.
-
-### Codex `config.toml`
-
-As an alternative to `codex mcp add`, add the server directly to
-`~/.codex/config.toml` (on Windows, usually
-`%USERPROFILE%\.codex\config.toml`) or to a trusted project's
-`.codex/config.toml`:
-
-```toml
-[mcp_servers.recon]
-command = "D:/Tools/recon-mcp/.venv/Scripts/python.exe"
-args = ["D:/Tools/recon-mcp/server.py"]
-```
-
-Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share this MCP
-configuration. In the graphical clients, you can instead add an MCP server in
-Settings, choose **STDIO**, and enter the same command and argument.
-
-### Gemini CLI analyst setup
-
-Use Codex as the campaign operator and Gemini as the independent analyst. The [Gemini CLI read-only allowlist](docs/scope-authorization.md#codex-and-gemini) exposes offline diagnostics and selected historical reads through the same STDIO startup command.
-
-### Other stdio MCP clients
-
-Clients that use JSON configuration commonly accept a structure like this. The
-configuration filename and settings screen vary by client, so check that client's
-documentation.
-
-```json
-{
-  "mcpServers": {
-    "recon": {
-      "command": "D:/Tools/recon-mcp/.venv/Scripts/python.exe",
-      "args": ["D:/Tools/recon-mcp/server.py"]
-    }
-  }
-}
-```
-
-If a CLI accepts a server command after `--`, the equivalent command portion is:
-
-```text
-D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
-```
-
-Select local stdio transport, not HTTP or SSE. This repository does not expose a
-remote MCP URL.
-
-### Manual launch and troubleshooting
-
-You can launch the server directly as a diagnostic:
-
-```powershell
-D:/Tools/recon-mcp/.venv/Scripts/python.exe D:/Tools/recon-mcp/server.py
-```
-
-A blank terminal that appears to wait is expected: the process is waiting for MCP
-JSON-RPC messages on stdin. Press `Ctrl+C` to stop it. It is not a standalone chat
-CLI.
-
-If the client cannot connect:
-
-- Confirm the Python and `server.py` paths are absolute and exist.
-- Run `codex mcp get recon` or inspect the equivalent client configuration.
-- Launch the command manually and check for import or configuration errors.
-- Confirm `config/scope.json` is valid; invalid or unsafe scope fails closed.
-- Do not put API tokens or bug-bounty platform credentials in MCP arguments.
-
-### Run alongside DirFuzz MCP
-
-You can run this alongside your Go DirFuzz MCP server:
-
-```toml
-[mcp_servers.recon]
-command = "D:/Tools/recon-mcp/.venv/Scripts/python.exe"
-args = ["D:/Tools/recon-mcp/server.py"]
-
-[mcp_servers.dirfuzz]
-command = "D:/Tools/DirFuzz-Mcp-Monitor/dirfuzz-mcp.exe"
-args = []
-env = {
-  DIRFUZZ_WORDLIST_DIR = "D:/Tools/DirFuzz-Mcp-Monitor/wordlists",
-  DIRFUZZ_SCOPE_DIR = "D:/Tools/H1-Scope-Watcher/snapshots",
-  DIRFUZZ_OUTPUT_DIR = "D:/Tools/DirFuzz-Mcp-Monitor/output"
-}
-```
-
-The key idea: Python Recon MCP `h1_snapshot_dir` and Go DirFuzz MCP `DIRFUZZ_SCOPE_DIR` should point to the same H1-Scope-Watcher snapshots folder.
+[Published v0.2.0 release](https://github.com/tobiasGuta/recon-mcp/releases/tag/v0.2.0) · [Changelog](CHANGELOG.md) · [Release preparation and qualification](docs/v0.2.0-release-preparation.md#qualification-and-release-status) · [Historical records](docs/README.md#release-and-engineering-records)
 
 ## Available Python MCP Tools
 
-- `health()`
-- `check_scope(domain: str)`
-- `resolve_scope_target(host_or_url: str, format: str | None = None)`
-- `check_scope_batch(hosts_or_urls: list[str], format: str | None = None)`
-- `get_scope_map()`
-- `recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict])`
-- `explain_scope_decision(host_or_url: str)`
-- `list_loaded_scope()`
-- `validate_scope_policy()`
-- `check_url_scope(url: str)`
-- `check_url_scope_batch(urls: list[str])`
-- `get_scope_policy_summary()`
-- `compare_scope_policies(before: str, after: str)`
-- `get_scope_capabilities()`
-- `fetch_headers(url: str)`
-- `fetch_robots(url: str)`
-- `fetch_sitemap(url: str)`
-- `collect_js_urls(url: str)`
-- `extract_endpoints_from_js(file_or_url: str, source_type: str | None = None)`
-- `dedupe_urls(urls: list[str])`
-- `create_evidence_note(finding: dict)`
-- `generate_manual_test_plan(target_summary: dict)`
-- `dirfuzz_integration_info()`
-- `create_campaign(program: str, target: str, notes: str | None = None)`
-- `list_campaigns(limit: int = 50)`
-- `get_campaign(campaign_id: str)`
-- `archive_campaign(campaign_id: str, reason: str | None = None)`
-- `list_archived_campaigns(limit: int = 50)`
-- `get_archived_campaign(campaign_id: str)`
-- `delete_archived_campaign(campaign_id: str, confirm_campaign_id: str)`
-- `fetch_headers_for_campaign(campaign_id: str, url: str)`
-- `fetch_robots_for_campaign(campaign_id: str, url: str)`
-- `fetch_sitemap_for_campaign(campaign_id: str, url: str)`
-- `collect_js_urls_for_campaign(campaign_id: str, url: str)`
-- `extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_type: str | None = None)`
-- `save_dirfuzz_analysis_for_campaign(campaign_id: str, analysis: dict)`
-- `create_finding_candidate(campaign_id: str, finding: dict)`
-- `get_finding(campaign_id: str, finding_id: str)`
-- `list_findings(campaign_id: str, status: str | None = None)`
-- `promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None)`
-- `demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str)`
-- `reject_finding(campaign_id: str, finding_id: str, reason: str)`
-- `create_campaign_evidence_note(campaign_id: str, finding: dict)`
-- `score_endpoint(endpoint: dict | str)`
-- `score_endpoints(endpoints: list[dict | str])`
-- `record_negative_result(campaign_id: str, target: str, check_type: str, result: str, repeat_after: str | None = None, metadata: dict | None = None)`
-- `list_negative_results(campaign_id: str, check_type: str | None = None)`
-- `generate_manual_test_plan_for_campaign(campaign_id: str)`
-- `generate_campaign_summary(campaign_id: str)`
-- `generate_report_candidate_markdown(campaign_id: str, finding_id: str)`
-- `detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str)`
-- `download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str)`
-- `extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str)`
-- `analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
-- `sourcemap_workflow_for_campaign(campaign_id: str, js_url: str)`
-- `external_sourcemapper_info()`
-- `scan_sensitive_artifacts_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
-- `extract_api_contracts_for_campaign(campaign_id: str, extracted_dir: str | None = None)`
-- `get_evidence_graph_summary(campaign_id: str)`
-- `query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit: int = 100)`
-- `import_dirfuzz_evidence_for_campaign(campaign_id: str, analysis_path: str | None = None)`
-- `discover_subdomains_passive_for_campaign(campaign_id: str, root_domain: str, providers: list[str] | None = None, max_results: int = 500, resolve_dns: bool = False)`
-- `compare_campaign_recon(campaign_id: str, baseline_campaign_id: str)`
-- `import_har_for_campaign(campaign_id: str, har_path: str)`
-- `import_burp_xml_for_campaign(campaign_id: str, xml_path: str)`
-- `verify_campaign_artifacts(campaign_id: str)`
-- `nuclei_integration_info()`
+See the [complete tool reference](docs/tool-reference.md) for parameters, return values, and effects.
 
-## Legacy Example Workflow
+<details>
+<summary>Show all 67 registered tool signatures</summary>
 
-1. Run H1-Scope-Watcher in Docker with snapshots written to a host-accessible folder.
-2. Point Python Recon MCP `h1_snapshot_dir` at that snapshots folder.
-3. Point Go DirFuzz MCP `DIRFUZZ_SCOPE_DIR` at that same snapshots folder.
-4. Check scope with Python Recon MCP.
-5. Fetch headers, robots.txt, and sitemap.xml.
-6. Collect JavaScript URLs from in-scope pages.
-7. Extract possible endpoints from JavaScript.
-8. Use Go DirFuzz MCP for directory fuzzing after scope is confirmed.
-9. Analyze DirFuzz results with `dirfuzz_analyze`.
-10. Generate a manual test plan.
-11. Create evidence notes for manually validated findings.
+- `health()` · [reference](docs/tool-reference.md#health)
+- `check_scope(domain: str)` · [reference](docs/tool-reference.md#check_scope)
+- `resolve_scope_target(host_or_url: str, format: str | None = None)` · [reference](docs/tool-reference.md#resolve_scope_target)
+- `check_scope_batch(hosts_or_urls: list[str], format: str | None = None)` · [reference](docs/tool-reference.md#check_scope_batch)
+- `get_scope_map()` · [reference](docs/tool-reference.md#get_scope_map)
+- `recommend_bugmap_parent(host_or_url: str, available_bugmap_targets: list[dict])` · [reference](docs/tool-reference.md#recommend_bugmap_parent)
+- `explain_scope_decision(host_or_url: str)` · [reference](docs/tool-reference.md#explain_scope_decision)
+- `list_loaded_scope()` · [reference](docs/tool-reference.md#list_loaded_scope)
+- `validate_scope_policy()` · [reference](docs/tool-reference.md#validate_scope_policy)
+- `check_url_scope(url: str)` · [reference](docs/tool-reference.md#check_url_scope)
+- `check_url_scope_batch(urls: list[str])` · [reference](docs/tool-reference.md#check_url_scope_batch)
+- `get_scope_policy_summary()` · [reference](docs/tool-reference.md#get_scope_policy_summary)
+- `compare_scope_policies(before: str, after: str)` · [reference](docs/tool-reference.md#compare_scope_policies)
+- `get_scope_capabilities()` · [reference](docs/tool-reference.md#get_scope_capabilities)
+- `fetch_headers(url: str)` · [reference](docs/tool-reference.md#fetch_headers)
+- `fetch_robots(url: str)` · [reference](docs/tool-reference.md#fetch_robots)
+- `fetch_sitemap(url: str)` · [reference](docs/tool-reference.md#fetch_sitemap)
+- `collect_js_urls(url: str)` · [reference](docs/tool-reference.md#collect_js_urls)
+- `extract_endpoints_from_js(file_or_url: str, source_type: str | None = None)` · [reference](docs/tool-reference.md#extract_endpoints_from_js)
+- `dedupe_urls(urls: list[str])` · [reference](docs/tool-reference.md#dedupe_urls)
+- `create_evidence_note(finding: dict)` · [reference](docs/tool-reference.md#create_evidence_note)
+- `generate_manual_test_plan(target_summary: dict)` · [reference](docs/tool-reference.md#generate_manual_test_plan)
+- `dirfuzz_integration_info()` · [reference](docs/tool-reference.md#dirfuzz_integration_info)
+- `create_campaign(program: str, target: str, notes: str | None = None)` · [reference](docs/tool-reference.md#create_campaign)
+- `list_campaigns(limit: int = 50)` · [reference](docs/tool-reference.md#list_campaigns)
+- `get_campaign(campaign_id: str)` · [reference](docs/tool-reference.md#get_campaign)
+- `archive_campaign(campaign_id: str, reason: str | None = None)` · [reference](docs/tool-reference.md#archive_campaign)
+- `list_archived_campaigns(limit: int = 50)` · [reference](docs/tool-reference.md#list_archived_campaigns)
+- `get_archived_campaign(campaign_id: str)` · [reference](docs/tool-reference.md#get_archived_campaign)
+- `delete_archived_campaign(campaign_id: str, confirm_campaign_id: str)` · [reference](docs/tool-reference.md#delete_archived_campaign)
+- `fetch_headers_for_campaign(campaign_id: str, url: str)` · [reference](docs/tool-reference.md#fetch_headers_for_campaign)
+- `fetch_robots_for_campaign(campaign_id: str, url: str)` · [reference](docs/tool-reference.md#fetch_robots_for_campaign)
+- `fetch_sitemap_for_campaign(campaign_id: str, url: str)` · [reference](docs/tool-reference.md#fetch_sitemap_for_campaign)
+- `collect_js_urls_for_campaign(campaign_id: str, url: str)` · [reference](docs/tool-reference.md#collect_js_urls_for_campaign)
+- `extract_endpoints_for_campaign(campaign_id: str, file_or_url: str, source_type: str | None = None)` · [reference](docs/tool-reference.md#extract_endpoints_for_campaign)
+- `save_dirfuzz_analysis_for_campaign(campaign_id: str, analysis: dict)` · [reference](docs/tool-reference.md#save_dirfuzz_analysis_for_campaign)
+- `create_finding_candidate(campaign_id: str, finding: dict)` · [reference](docs/tool-reference.md#create_finding_candidate)
+- `get_finding(campaign_id: str, finding_id: str)` · [reference](docs/tool-reference.md#get_finding)
+- `list_findings(campaign_id: str, status: str | None = None)` · [reference](docs/tool-reference.md#list_findings)
+- `promote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str, gate_updates: dict | None = None)` · [reference](docs/tool-reference.md#promote_finding)
+- `demote_finding(campaign_id: str, finding_id: str, target_status: str, reason: str)` · [reference](docs/tool-reference.md#demote_finding)
+- `reject_finding(campaign_id: str, finding_id: str, reason: str)` · [reference](docs/tool-reference.md#reject_finding)
+- `create_campaign_evidence_note(campaign_id: str, finding: dict)` · [reference](docs/tool-reference.md#create_campaign_evidence_note)
+- `score_endpoint(endpoint: dict | str)` · [reference](docs/tool-reference.md#score_endpoint)
+- `score_endpoints(endpoints: list[dict | str])` · [reference](docs/tool-reference.md#score_endpoints)
+- `record_negative_result(campaign_id: str, target: str, check_type: str, result: str, repeat_after: str | None = None, metadata: dict | None = None)` · [reference](docs/tool-reference.md#record_negative_result)
+- `list_negative_results(campaign_id: str, check_type: str | None = None)` · [reference](docs/tool-reference.md#list_negative_results)
+- `generate_manual_test_plan_for_campaign(campaign_id: str)` · [reference](docs/tool-reference.md#generate_manual_test_plan_for_campaign)
+- `generate_campaign_summary(campaign_id: str)` · [reference](docs/tool-reference.md#generate_campaign_summary)
+- `generate_report_candidate_markdown(campaign_id: str, finding_id: str)` · [reference](docs/tool-reference.md#generate_report_candidate_markdown)
+- `detect_sourcemap_references_for_campaign(campaign_id: str, js_url: str)` · [reference](docs/tool-reference.md#detect_sourcemap_references_for_campaign)
+- `download_sourcemap_for_campaign(campaign_id: str, sourcemap_url: str)` · [reference](docs/tool-reference.md#download_sourcemap_for_campaign)
+- `extract_sourcemap_sources_for_campaign(campaign_id: str, map_path: str)` · [reference](docs/tool-reference.md#extract_sourcemap_sources_for_campaign)
+- `analyze_sourcemap_sources_for_campaign(campaign_id: str, extracted_dir: str | None = None)` · [reference](docs/tool-reference.md#analyze_sourcemap_sources_for_campaign)
+- `sourcemap_workflow_for_campaign(campaign_id: str, js_url: str)` · [reference](docs/tool-reference.md#sourcemap_workflow_for_campaign)
+- `external_sourcemapper_info()` · [reference](docs/tool-reference.md#external_sourcemapper_info)
+- `scan_sensitive_artifacts_for_campaign(campaign_id: str, extracted_dir: str | None = None)` · [reference](docs/tool-reference.md#scan_sensitive_artifacts_for_campaign)
+- `extract_api_contracts_for_campaign(campaign_id: str, extracted_dir: str | None = None)` · [reference](docs/tool-reference.md#extract_api_contracts_for_campaign)
+- `get_evidence_graph_summary(campaign_id: str)` · [reference](docs/tool-reference.md#get_evidence_graph_summary)
+- `query_evidence_graph(campaign_id: str, node_uuid: str, depth: int = 1, limit: int = 100)` · [reference](docs/tool-reference.md#query_evidence_graph)
+- `import_dirfuzz_evidence_for_campaign(campaign_id: str, analysis_path: str | None = None)` · [reference](docs/tool-reference.md#import_dirfuzz_evidence_for_campaign)
+- `discover_subdomains_passive_for_campaign(campaign_id: str, root_domain: str, providers: list[str] | None = None, max_results: int = 500, resolve_dns: bool = False)` · [reference](docs/tool-reference.md#discover_subdomains_passive_for_campaign)
+- `compare_campaign_recon(campaign_id: str, baseline_campaign_id: str)` · [reference](docs/tool-reference.md#compare_campaign_recon)
+- `import_har_for_campaign(campaign_id: str, har_path: str)` · [reference](docs/tool-reference.md#import_har_for_campaign)
+- `import_burp_xml_for_campaign(campaign_id: str, xml_path: str)` · [reference](docs/tool-reference.md#import_burp_xml_for_campaign)
+- `verify_campaign_artifacts(campaign_id: str)` · [reference](docs/tool-reference.md#verify_campaign_artifacts)
+- `nuclei_integration_info()` · [reference](docs/tool-reference.md#nuclei_integration_info)
 
-For campaign mode, prefer the campaign workflow above. Candidate findings are not vulnerabilities, everything starts in hallucinations until validated manually, reports are not auto-submitted, and DirFuzz remains separate in the Go DirFuzz MCP server.
-
-## Project Layout
-
-| Location | Responsibility |
-| --- | --- |
-| `server.py` | STDIO MCP entry point and tool registration |
-| `config/` | Synthetic manual and Burp examples. Git ignores the active policy. |
-| `recon/authorization.py`, `scope.py`, `h1_scope.py`, `policy_io.py`, `scope_cli.py` | Policy compilation, legacy host inventory, safe policy reads, and local CLI |
-| `recon/http_fetch.py`, `pinned_transport.py` | Shared request authorization, DNS checks, numeric connections, TLS, and bounded reads |
-| `recon/campaigns.py`, `campaign_scope.py`, `campaign_lock.py`, `campaign_jsonl.py` | Campaign metadata, current policy bindings, storage locking, and coordinated history |
-| `recon/safeio.py`, `integrity.py`, `audit.py`, `evidence_graph.py`, `memory.py` | Campaign file safety, artifact publication and verification, audit and evidence |
-| `recon/js_analysis.py`, `sourcemaps.py`, `passive.py`, and other analysis modules | Bounded target or campaign workflows |
-| `docs/`, `tests/`, `output/` | Operational and audit documentation, offline regression tests, and ignored generated campaign files |
-
-## Development
-
-Run these commands from the repository root on Fedora.
-
-```bash
-.venv/bin/python -m pytest
-.venv/bin/python -m pip check
-.venv/bin/python server.py </dev/null
-git diff --check
-```
-
-Use the [final qualification report](docs/v0.2.0-final-qualification-report.md) for the independent re-audit conditions, regression commands, and qualification limits.
-
-## Disclaimer
-
-Use this only for authorized bug bounty and security testing workflows. The server is intentionally scoped and conservative, and it is not an autonomous hacking agent.
+</details>

@@ -6,7 +6,7 @@ Recon MCP is an authorized, low-risk, human-led reconnaissance assistant. It org
 
 Recon MCP hands tool results to the connected client over STDIO. Local analyzers run in the server process. Passive provider requests disclose the queried root domain when the active policy explicitly allows the provider URL. The client can have additional data-handling behavior of its own.
 
-DirFuzz and any future Nuclei implementation remain separate MCP servers with separate trust boundaries. Recon MCP only imports their already-saved, structured, redacted output.
+External processes have independent trust boundaries. Recon MCP can save and import reviewed DirFuzz analysis. The Nuclei and external source mapper tools describe informational contracts. [External integrations](integrations.md)
 
 ## Data flow
 
@@ -22,7 +22,7 @@ DirFuzz and any future Nuclei implementation remain separate MCP servers with se
 
 ## Local file boundary
 
-Campaign tools accept only resolved paths under the campaign or a narrower documented campaign subdirectory. A private lock file beside the active and archived roots provides one transaction boundary for supported Linux campaign operations. Traversal and symlinks are rejected. Reads are bounded before parsing. Artifact writes use a same-directory temporary file and atomic replacement, and failed writes remove the temporary file. HAR and Burp files must already be in the campaign (the `imports` directory is recommended); imports never replay traffic.
+Campaign-local import and analysis tools validate paths under the campaign or a narrower documented directory. The shared JavaScript file reader used by both standalone and campaign endpoint extraction accepts inputs whose resolved location is under the project root. Keep the whole project tree within the operator's trust boundary. A private lock file beside the active and archived roots provides one transaction boundary for supported Linux campaign operations. Traversal and symlinks are rejected. Reads are bounded before parsing. Artifact writes use a same-directory temporary file and atomic replacement, and failed writes remove the temporary file. HAR and Burp files must already be in the campaign (the `imports` directory is recommended); imports never replay traffic.
 
 ## Secret handling
 
@@ -44,7 +44,7 @@ The enumerations in `recon/evidence_graph.py` are the compatibility contract for
 
 ## Artifact integrity and provenance
 
-New structured artifacts contain an artifact UUID, tool/project versions, creation time, scope-snapshot hash, parent/input IDs, truncation status, and applied limits. A sibling `.metadata.json` contains the SHA-256 calculated from the final artifact bytes. The writer synchronizes an update marker before replacing either file. The verifier shares the storage lock and reports a surviving marker as an interrupted pair. Audit and negative-result history use descriptor-relative append and recover a bounded unterminated tail. Verification is read-only and reports verified, missing, modified, malformed, and unsupported legacy artifacts without rewriting evidence.
+New structured artifacts contain an artifact UUID, tool/project versions, creation time, scope-snapshot hash, parent/input IDs, truncation status, and applied limits. A sibling `.metadata.json` contains the SHA-256 calculated from the final artifact bytes. The writer synchronizes an update marker before replacing either file. The verifier shares the storage lock and reports a surviving marker as an interrupted pair. Audit and negative-result history use descriptor-relative append and recover a bounded unterminated tail. Verification checks evidence without rewriting artifact bytes and appends an audit record. The result distinguishes verified, missing, modified, malformed, interrupted, and unsupported legacy artifacts.
 
 ## XML, subprocess, and external interaction policy
 
@@ -57,13 +57,13 @@ Passive providers necessarily receive the queried authorized root domain. Option
 - Scope assets and wildcard authority are configured by a human.
 - Passive DNS resolution requires explicit opt-in.
 - Secret and contract candidates require manual validation.
-- Finding promotion continues through the existing human-gated finding pipeline.
+- Finding promotion checks status transitions and operator-supplied gate values. The client and operator are responsible for approval and for validating the evidence behind those values.
 - Reports remain local drafts and are never submitted.
-- A future Nuclei MCP must build an exact-template, one-target plan and require explicit approval before execution.
+- The Nuclei information tool describes requirements for a future separate implementation.
 
 ## Final qualification boundaries
 
-The final regression suite detects userinfo in nested query URLs and checks that diagnostics, HTTP errors, audit records, and artifact metadata suppress the recognized credentials. The shared inspection is bounded, and raw source evidence retains its original bytes. Campaign directories are private, and the storage lock requires a supported local Linux filesystem and GIL-enabled CPython. The trusted, untrusted, and wrong-host TLS cases used real loopback connections and temporary test certificates. [Final qualification report](v0.2.0-final-qualification-report.md)
+The final regression suite detects userinfo in nested query URLs and checks that diagnostics, HTTP errors, audit records, and artifact metadata suppress the recognized credentials. The shared inspection is bounded, and raw source evidence retains its original bytes. Campaign directories are private, and the storage lock requires a supported local Linux filesystem and GIL-enabled CPython. The trusted, untrusted, and wrong-host TLS cases used real loopback connections and temporary test certificates. [Final release qualification verdict](v0.2.0-release-preparation.md#qualification-and-release-status) · [TLS engineering record](v0.2.0-final-qualification-report.md#tls-interoperability)
 
 ## Threat model and limitations
 

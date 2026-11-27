@@ -10,7 +10,7 @@ Recon MCP authorizes a complete HTTP or HTTPS request URL against one active loc
 | `h1_snapshots` | Local structured scope entries. Bare names match exactly, explicit `*.` rules match descendants, and complete URLs preserve scheme, port, exact path, and any explicitly present query. Submission eligibility is required. Bounty eligibility can be required separately. | Free-text instructions exclude the affected entries until a human translates them into a supported policy. Clearly non-web assets for iOS, Android, source code, executables, and hardware are skipped. Unrecognized asset types or snapshot fields invalidate the policy. Optional maximum age uses the local file modification time. |
 | `burp_advanced` | Enabled Advanced Scope rules match protocol, normalized host, effective port, and path. Exclusions override inclusions. | Only the documented regex subset is supported. Burp's File field ignores queries. A Burp export carries no bounty-eligibility information. [PortSwigger Advanced Scope documentation](https://portswigger.net/burp/documentation/desktop/tools/target/scope) |
 
-The active configuration is `config/scope.json`. A missing file gives an empty manual policy. Empty scope denies every request. Malformed input denies requests without falling back to an earlier policy. When replacing an active file, write a complete replacement beside it and rename it over the old file. Recon MCP reads the current policy on demand and checks for changes while reading source files. H1 snapshot directories are local inputs. The server never calls HackerOne to refresh them.
+The active configuration is `config/scope.json` relative to the source tree the server loads. A development install reads it from the checkout. The guarded stable deployment reads it from the physical `runtime/` tree. Run the examples against disposable state. A missing file gives an empty manual policy. Empty scope denies every request. Malformed input denies requests without falling back to an earlier policy. When replacing an active file, write a complete replacement beside it and rename it over the old file. Recon MCP reads the current policy on demand and checks for changes while reading source files. H1 snapshot directories are local inputs. The server never calls HackerOne to refresh them.
 
 ### Manual configuration
 
@@ -19,7 +19,8 @@ The active configuration is `config/scope.json`. A missing file gives an empty m
   "scope_source": "manual",
   "allowed_assets": [
     {"value": "api.example.test", "scheme": "https", "port": 443, "path_prefix": "/public/"},
-    {"value": "*.cdn.example.test", "match": "wildcard", "scheme": "https"}
+    {"value": "*.cdn.example.test", "match": "wildcard", "scheme": "https", "port": 443},
+    {"value": "docs.example.test", "scheme": "https", "port": 8443, "path": "/index.json", "query": "lang=en"}
   ],
   "url_exclude": [
     {"value": "api.example.test", "path_prefix": "/public/private/"}
@@ -32,12 +33,14 @@ An inclusion may be a plain legacy `allowed_domains` entry, a complete URL in `a
 
 If an existing hostname list should stay in place, supply a `url_include` array of asset objects. A request must match the list of initial inclusions and one member of `url_include`. An explicit empty `url_include` denies all requests. `url_exclude` accepts the same asset format. `blocked_domains` accepts bare names and blocks each name plus its descendants. An explicit wildcard in an asset covers multiple subdomain levels and leaves the apex outside scope.
 
-### H1-Scope-Watcher configuration
+In this example, the exact query rule covers `https://docs.example.test:8443/index.json?lang=en`. Omitting the port, changing the path, or adding another query parameter denies it. The `api.example.test` exclusion overrides the otherwise eligible `/public/` inclusion.
+
+### HackerOne snapshots
 
 ```json
 {
   "scope_source": "h1_snapshots",
-  "h1_snapshot_dir": "/home/operator/h1-scope-watcher/snapshots",
+  "h1_snapshot_dir": "/absolute/path/to/local/snapshots",
   "h1_snapshot_program": "example-program",
   "include_only_submission_eligible": true,
   "include_only_bounty_eligible": false,
@@ -45,14 +48,46 @@ If an existing hostname list should stay in place, supply a `url_include` array 
 }
 ```
 
-Point `h1_snapshot_dir` to the local snapshot directory. If it contains multiple JSON files, use `h1_snapshot_program` to select one by filename without `.json`. Network authorization uses one program. An unselected multi-program directory remains available as legacy host inventory. On Windows, a directory such as `D:/Tools/H1-Scope-Watcher/snapshots` works with host-visible JSON exports. This source always requires submission eligibility for URL authorization. The existing submission filter continues to control inventory visibility. Non-submission-eligible entries and entries filtered by the optional bounty requirement are exclusions, including when a wildcard also covers the target. Nonempty asset instructions are handled as exclusions. An exact parent entry can still help label a child in the legacy inventory. To authorize the child, the policy must include it through an exact or explicit wildcard rule. An omitted age limit leaves freshness verification to the operator. Review the upstream program scope independently of the snapshot timestamp. [HackerOne structured scope schema](https://api.hackerone.com/hacker-reference/#structured-scope)
+Point `h1_snapshot_dir` to the local snapshot directory. If it contains multiple JSON files, use `h1_snapshot_program` to select one by filename without `.json`. Network authorization uses one program. An unselected multi-program directory remains available as legacy host inventory. This source always requires submission eligibility for URL authorization. The existing submission filter continues to control inventory visibility. Non-submission-eligible entries and entries filtered by the optional bounty requirement are exclusions, including when a wildcard also covers the target. Nonempty asset instructions are handled as exclusions. An exact parent entry can still help label a child in the legacy inventory. To authorize the child, the policy must include it through an exact or explicit wildcard rule. An omitted age limit leaves freshness verification to the operator. Review the upstream program scope independently of the snapshot timestamp. Give Recon MCP only the local structured snapshot path. Keep API credentials and watcher configuration in the external integration's own private environment. [HackerOne structured scope schema](https://api.hackerone.com/hacker-reference/#structured-scope)
 
 ### Burp Advanced Scope configuration
 
 ```json
 {
   "scope_source": "burp_advanced",
-  "burp_scope_file": "/home/operator/recon-policies/burp-scope.json"
+  "burp_scope_file": "/absolute/path/to/runtime/config/policies/burp-scope-reviewed.json"
+}
+```
+
+In Burp Suite, configure **Target scope** using advanced rules. In **Settings**, save the **Target** project settings to a private JSON file. Use the **Target** subset to avoid including unrelated project configuration. Preserve the original export and copy only the reviewed scope into a candidate as needed. [PortSwigger settings export](https://portswigger.net/burp/documentation/desktop/settings) · [PortSwigger target scope](https://portswigger.net/burp/documentation/desktop/tools/target/scope)
+
+This complete export uses reserved synthetic names.
+
+```json
+{
+  "target": {
+    "scope": {
+      "advanced_mode": true,
+      "include": [
+        {
+          "enabled": true,
+          "protocol": "https",
+          "host": "^api\\.example\\.test$",
+          "port": "^443$",
+          "file": "^/public/.*$"
+        }
+      ],
+      "exclude": [
+        {
+          "enabled": true,
+          "protocol": "https",
+          "host": "^api\\.example\\.test$",
+          "port": "^443$",
+          "file": "^/public/private/.*$"
+        }
+      ]
+    }
+  }
 }
 ```
 
@@ -60,42 +95,77 @@ Use an absolute path to a local export with `target.scope.advanced_mode: true` a
 
 Every rule requires a Boolean `enabled`. Disabled rules have no effect. The `protocol` field accepts HTTP, HTTPS, any, or blank, regardless of case. A missing or blank host, port, or file field matches all values of that component. The literal expression `.*` also matches all values. Other expressions require explicit `^` and `$` anchors. The supported ASCII grammar consists of literal alphanumerics and punctuation, escaped regex punctuation, dot, positive character classes with ASCII letter or digit ranges, and at most one `.*` per expression. DNS host expressions use lowercase ASCII or IDNA A-labels. For example, `^api\.example\.test$` matches the exact host, `^.*\.example\.test$` matches its descendants, `^443$` matches HTTPS's implicit or explicit port 443, and `^/public/.*$` matches paths beneath `/public/`.
 
-Groups, alternation, lookarounds, backreferences, flags, Unicode classes, other quantifiers, unanchored patterns, and Burp IP range syntax are rejected. A single variable-width token is evaluated by matching fixed-width prefix and suffix portions. The parser rejects unsupported expressions before applying any rule, including unsupported exclusions. Deployments that receive a Burp export outside this subset need a reviewed translation and offline checks against expected allow and deny examples.
+Groups, alternation, lookarounds, backreferences, flags, Unicode classes, other quantifiers, unanchored patterns, and Burp IP range syntax are rejected. A single variable-width token is evaluated by matching fixed-width prefix and suffix portions. The parser rejects unsupported expressions before applying any rule, including unsupported exclusions. For example, `^/.*` has no closing anchor and is rejected. `^/.*$` is accepted and matches paths beginning with `/`. Confirm the intended match and exclusion semantics manually before editing either side of an export. Review allow and deny cases offline, including excluded paths and explicit non-default ports. Native Burp runtime parity is outside qualification.
 
 ## Offline validation and migration
 
-Run from the repository root. On Windows, substitute `.\.venv\Scripts\python.exe` for `.venv/bin/python` in commands.
+For stable deployments, ordinary private state can look like this:
 
-```bash
-.venv/bin/python -m recon.scope_cli validate
-.venv/bin/python -m recon.scope_cli validate --config /absolute/path/to/proposed-scope.json
-.venv/bin/python -m recon.scope_cli check 'https://api.example.test/public/' --config /absolute/path/to/proposed-scope.json
-.venv/bin/python -m recon.scope_cli compare before after
+```text
+~/.local/share/recon-mcp/runtime/
+├── config/
+│   ├── scope.json
+│   └── policies/
+│       ├── burp-scope.json
+│       ├── burp-scope-reviewed.json
+│       └── candidate-reviewed.json
+└── output/
 ```
 
-1. Stage proposed changes separately. The CLI accepts a local configuration path for `validate` and `check` without activating it.
-2. Use the full URL tool to check examples across hosts, schemes, ports, paths, and exclusions. A positive offline result still requires current policy and public DNS checks at dispatch.
-3. Optionally stage both configs in the Git-ignored `config/policies/` directory as `before.json` and `after.json`. Comparison takes their names without the extension. Any referenced files or H1 snapshot directories must stay under `config/policies/`. Relative H1 paths, when used, resolve from the server working directory. Use absolute local paths inside the comparison directory for predictable results.
-4. Replace `config/scope.json` only after review. Changes in policy fingerprints pause network work for existing campaigns.
+Use the same version's venv for the offline CLI. From the development checkout, set `py="$PWD/.venv/bin/python"`. From the stable runtime, set it to the active release's interpreter as shown below. Keep the physical runtime's code unchanged and use the guarded launcher for serving MCP.
+
+```bash
+root="$HOME/.local/share/recon-mcp"
+cd -- "$root/runtime"
+py="$root/releases/0.2.0/.venv/bin/python"
+```
+
+1. Stage changes separately in a private directory. The CLI accepts a config path for `validate` and `check` without activating it. On stable and development installations, use the selected `py` from the corresponding source root.
+
+   ```bash
+   "$py" -E -s -B -m recon.scope_cli validate --config config/policies/candidate-reviewed.json
+   "$py" -E -s -B -m recon.scope_cli check https://api.example.test/public/ --config config/policies/candidate-reviewed.json
+   "$py" -E -s -B -m recon.scope_cli check https://api.example.test/public/private/ --config config/policies/candidate-reviewed.json
+   ```
+
+   For the example Burp policy, the final check exits 1 with `explicit_exclusion`. Test both positive and negative URLs, including ports, schemes, paths, and queries. Check the full policy fingerprint, source, rule counts, and warnings.
+
+2. Optionally compare staged copies named `before.json` and `after.json` inside `config/policies/`. Use physical local source paths within the comparison directory for all referenced files and snapshot directories. Relative H1 paths resolve from the working directory and must still fall inside the comparison directory. Use absolute paths for predictable comparisons.
+
+   ```bash
+   "$py" -E -s -B -m recon.scope_cli compare before after
+   ```
+
+3. Back up the active config and every referenced export or snapshot in private storage. Review the candidate's referenced files again before activation. From the physical source root, publish a complete same-directory replacement with private permissions.
+
+   ```bash
+   pending_policy=$(mktemp config/.scope.XXXXXXXX)
+   install -m 0600 -- config/policies/candidate-reviewed.json "$pending_policy" &&
+     mv -T -- "$pending_policy" config/scope.json &&
+     "$py" -E -s -B -m recon.scope_cli validate
+   ```
+
+   Compare the active fingerprint to the reviewed candidate. If activation or verification fails, inspect the error and remove any unused temporary file. A changed fingerprint pauses network work for existing campaigns. To restore a backup, repeat validation and atomic replacement using the backed-up policy and its reviewed sources.
 
 The CLI exits with status 1 when validation finds a rejected or empty policy, a URL is denied, the comparison fails, or campaign reauthorization fails. The MCP validation result distinguishes syntactic validity from readiness. A valid empty policy has `valid: true` and `safe_to_activate: false`. An indeterminate comparison may still succeed as a structural diff.
 
-### MCP tool schemas
+### Reading a URL decision
 
-| Tool | Inputs | Response |
-| --- | --- | --- |
-| `validate_scope_policy` | `{}` | `valid`, `safe_to_activate`, policy source, fingerprint, schema version, rule counts, supported rules, first configuration error, unsupported-rule diagnostics, and warnings. |
-| `check_url_scope` | `{"url": "https://api.example.test/public/"}` | The authorization decision described below. |
-| `check_url_scope_batch` | `{"urls": ["https://api.example.test/public/"]}` | `ok`, `count`, `policy_fingerprint`, and one `results` entry per URL. Batch limit 100 URLs, 4,096 characters per URL, 128 KiB total UTF-8. |
-| `get_scope_policy_summary` | `{}` | Rule counts, source, fingerprint, schema version, supported constraints, and limitations. |
-| `compare_scope_policies` | `{"before": "before", "after": "after"}` | Added and removed rules, probable paired edits and changed fields, exclusion changes, fingerprints, and possible authorization expansion or reduction. Identical canonical policies are reported as identical. Other comparisons are indeterminate about set equivalence and containment. |
-| `get_scope_capabilities` | `{}` | Source capabilities, limitations, schema version, and URL and batch limits. |
+See the [tool reference](tool-reference.md#authorization-and-scope) for the six diagnostic schemas. Each URL decision includes a unique `decision_id`, a UTC `timestamp`, redacted normalized components, a policy source and schema version, and matching rule descriptions where available. Rule descriptions omit query values.
 
-Every URL decision includes a unique `decision_id`, UTC `timestamp`, `authorized`, `network_execution_permitted`, `reason_code`, explanation, policy source, schema version, and fingerprint when known. Normalized components show scheme, hostname, effective port, path, and query presence. Matched inclusion, exclusion, and restriction rules include stable rule IDs where applicable. Rule expressions and provenance omit query values. Submitted credentials and recognizable sensitive URL values are rejected. A decision before policy load can have a null fingerprint. The fingerprint identifies the canonical rules, source, and H1 selection when applicable. Formatting, rule order, duplicates, and HTTP processing settings do not affect it.
+| Field | Meaning |
+| --- | --- |
+| `authorized` | The full URL satisfied the current compiled policy and offline URL checks. |
+| `in_scope` | Mirrors `authorized` in the full URL response. A legacy hostname result uses this field for inventory membership. |
+| `network_execution_permitted` | Mirrors `authorized` in the full URL response. Dispatch still checks policy, addresses, and applicable campaign binding. Host inventory always returns false here. |
+| `reason_code` | Machine-readable reason for the decision. A regular scope denial can carry `ok: true`, so read `authorized` for the decision. |
+| `policy_fingerprint` | SHA-256 of the canonical policy. It may be null if the URL was rejected before policy loaded. Formatting, rule order, duplicates, and HTTP processing settings do not affect it. |
+
+With the sample manual policy, `https://api.example.test/public/` returns `allowed` and true for all three URL flags. `https://api.example.test/public/private/` returns `explicit_exclusion` and false for those flags. These results demonstrate local rule matching. Confirm current written program or owner permission independently.
 
 ### Interoperability flags
 
-Manual and Burp policies provide URL authorization. Their submission and bounty eligibility values are JSON `null`. H1 host inventory retains explicit Boolean eligibility values. Missing values remain unknown. An authorized H1 URL establishes submission eligibility under the current policy. A rejected URL leaves the remote program's eligibility unknown.
+Eligibility fields are supplied by inventory and interoperability responses where applicable. The direct `check_url_scope` result has the decision fields above. Manual and Burp policies provide URL authorization. Their submission and bounty eligibility values are JSON `null`. H1 host inventory retains explicit Boolean eligibility values. Missing values remain unknown. An authorized H1 URL establishes submission eligibility under the current policy. A rejected URL leaves the remote program's eligibility unknown.
 
 | Flag | Meaning |
 | --- | --- |
@@ -128,44 +198,15 @@ Campaign and transport guard errors also include `invalid_campaign_binding`, `in
 
 Creation records the canonical original target and its authorization decision in `campaign.json` and `scope.json`. A bare hostname uses its HTTPS root URL. Campaign anchors must be query-free. Use an explicit authorized URL for assets with path or port restrictions. A policy that authorizes only query-bearing URLs cannot anchor a campaign until the operator establishes a permitted query-free URL. Network-facing campaign operations require the current policy to match the saved binding and still permit the campaign anchor. Each actual network request independently passes the same current policy. Campaign bindings cover the active policy, so each request still needs its own inclusion and exclusion evaluation.
 
-If a campaign has no binding or the fingerprint changed, review the active policy and reauthorize from a local interactive terminal.
+If a campaign has no binding or the fingerprint changed, review the active policy and reauthorize from a local interactive terminal. Use the same current environment and `py` path as for offline validation.
 
 ```bash
-.venv/bin/python -m recon.scope_cli validate
-.venv/bin/python -m recon.scope_cli check https://api.example.test/public/
-.venv/bin/python -m recon.scope_cli reauthorize-campaign CAMPAIGN_ID https://api.example.test/public/ --confirm-fingerprint FULL_POLICY_FINGERPRINT
+"$py" -E -s -B -m recon.scope_cli validate
+"$py" -E -s -B -m recon.scope_cli check https://api.example.test/public/
+"$py" -E -s -B -m recon.scope_cli reauthorize-campaign CAMPAIGN_ID https://api.example.test/public/ --confirm-fingerprint FULL_POLICY_FINGERPRINT
 ```
 
 Use an anchor on the campaign's original normalized hostname. This updates its active binding and appends an audit event. The original scope snapshot, existing artifacts, and evidence remain available. Reauthorization is exposed through the local CLI and requires the currently reviewed fingerprint. Historical campaign reads continue when the active policy changes or becomes invalid.
-
-## Codex and Gemini
-
-Use Codex as the primary operator and campaign manager. Follow the [Codex STDIO setup](../README.md#codex-cli). Configure Gemini CLI as an independent offline analyst using the same local executable with a client-side allowlist. Replace both paths for your checkout.
-
-```json
-{
-  "mcpServers": {
-    "recon": {
-      "command": "/home/operator/recon-mcp/.venv/bin/python",
-      "args": ["/home/operator/recon-mcp/server.py"],
-      "includeTools": [
-        "health",
-        "validate_scope_policy",
-        "check_url_scope",
-        "check_url_scope_batch",
-        "get_scope_policy_summary",
-        "compare_scope_policies",
-        "get_scope_capabilities",
-        "get_campaign",
-        "list_findings",
-        "get_finding"
-      ]
-    }
-  }
-}
-```
-
-Gemini CLI uses `includeTools` and gives `excludeTools` precedence if both are configured. Client filtering limits which tools Gemini advertises. A client with direct access to the STDIO executable or the workspace retains that access. Use separate operating-system permissions when an independent read-only boundary is required. [Gemini CLI MCP configuration](https://geminicli.com/docs/reference/configuration/#mcp)
 
 ## Operational limits
 
@@ -194,9 +235,4 @@ Campaign locking requires GIL-enabled CPython on Linux and an allowlisted local 
 
 The Fedora fixture generated a temporary CA and leaf certificate and listened only on an ephemeral IPv4 loopback port. It executed the pinned transport and real OpenSSL handshake. The trusted certificate succeeded, SNI and HTTP Host matched the authorized identity, and the server observed the connection close. The untrusted and wrong-host certificates failed verification before HTTP. Only the test admits its exact loopback endpoint and uses its test CA. Production local-address restrictions and certificate verification apply as before. The fixture does not qualify external routing, Windows execution, or native Burp runtime parity.
 
-## Troubleshooting
-
-- If the server appears idle at launch, it is waiting for STDIO JSON-RPC. Check the Python and server paths, then run `python -m pip check` in the intended virtual environment.
-- If Burp validation reports a rule index, review the indicated enabled rule in a copy of the export. Re-run validation before activating the copy.
-- If the H1 snapshot directory fails validation, check its location, file age, JSON format, and asset types. Use a dedicated directory of local reviewed snapshots.
-- If a request reports a path mismatch, verify the complete URL, including any root file derived by the tool or any redirect hop. Check the fingerprint and campaign binding before retrying.
+See [Troubleshooting](troubleshooting.md#policy-and-url-decisions) for scope diagnostics and recovery.
