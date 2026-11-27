@@ -1,0 +1,13 @@
+# The complete previously exercised environment, beyond the runtime closure.
+-r fedora45-cpython315-runtime.txt
+httpcore2==2.16.2
+httpx2==2.16.2
+iniconfig==2.3.1
+mcp-types==2.3.0
+opentelemetry-api==1.45.2
+packaging==26.4
+pip==26.3
+pluggy==1.7.0
+pygments==2.21.0
+pytest==9.2.0
+truststore==0.10.5
