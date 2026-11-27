@@ -60,10 +60,12 @@ Passive providers necessarily receive the queried authorized root domain. DNS re
 - Scope assets and wildcard authority are configured by a human.
 - Passive DNS resolution requires explicit opt-in.
 - Secret and contract candidates require manual validation.
-- Finding promotion continues through the existing human-gated finding pipeline.
+- Upward transitions are unavailable to MCP clients. The separate local `python -m recon.review` CLI requires an interactive terminal and explicit operator attestations. Candidate gates are ignored and demotions clear gates. The boundary assumes the MCP client cannot run arbitrary local commands or modify campaign files; TTY checks do not authenticate a human.
 - Reports remain local drafts and are never submitted.
 - A future Nuclei MCP must build an exact-template, one-target plan and require explicit approval before execution.
 
 ## Threat model and limitations
+
+Target HTTP clients ignore ambient proxy configuration. DNS preflight checks still do not pin the address used by the actual connection; do not treat them as complete DNS rebinding protection. Header values outside the diagnostic allowlist are suppressed; allowlisted values receive best-effort redaction, not a guarantee against arbitrary embedded secrets. Other result types require separate review. Local finding updates are not transactionally locked.
 
 Controls address SSRF, redirects, DNS rebinding, private-network access, oversized streams/files, traversal, symlinks, XML entities, secret leakage, unbounded result sets, evidence tampering, and accidental promotion of recon leads. Deterministic regex extraction can miss obfuscated code and can produce false positives; uncertainty and confidence are therefore explicit. Passive providers may be unavailable, incomplete, rate-limited, or privacy-sensitive. Artifact hashes detect modification but do not provide signatures or an external timestamp authority. Existing legacy artifacts without sidecars remain readable but are reported as unsupported legacy evidence.

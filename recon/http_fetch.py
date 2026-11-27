@@ -69,8 +69,10 @@ def _origin_url(url: str) -> str:
 
 
 def _headers_dict(response: httpx.Response) -> dict:
-    """Convert response headers into a plain dictionary."""
-    return {key: value for key, value in response.headers.items()}
+    """Expose selected diagnostic values; unknown and sensitive headers are names only."""
+    allowed = {name.lower() for name in SECURITY_HEADERS} | {"content-type", "content-length", "cache-control"}
+    return {key: redact_text(value) if key.lower() in allowed else "<redacted>"
+            for key, value in response.headers.items()}
 
 
 def get_limit(name: str) -> int:
@@ -103,6 +105,7 @@ def _client() -> httpx.Client:
     return httpx.Client(
         timeout=TIMEOUT_SECONDS,
         follow_redirects=False,
+        trust_env=False,
         headers={"User-Agent": get_user_agent()},
     )
 
@@ -257,6 +260,7 @@ def fetch_headers(url: str) -> dict:
                     if response.status_code in {403, 405}:
                         fallback_reason = f"HEAD returned {response.status_code}"
                         method_used = "GET"
+                        response.close()
                         response = _safe_get_headers(client, url)
                 except httpx.HTTPError as exc:
                     fallback_reason = f"HEAD request failed: {exc}"
@@ -283,8 +287,8 @@ def fetch_headers(url: str) -> dict:
 
     cookie_headers = response.headers.get_list("set-cookie")
     for cookie in cookie_headers:
-        cookie_lower = cookie.lower()
-        if "secure" not in cookie_lower or "httponly" not in cookie_lower or "samesite" not in cookie_lower:
+        attributes = {part.strip().split("=", 1)[0].lower() for part in cookie.split(";")[1:]}
+        if not {"secure", "httponly", "samesite"}.issubset(attributes):
             notes.append("Set-Cookie observed without all common flags; manual review recommended.")
             break
 
@@ -297,7 +301,7 @@ def fetch_headers(url: str) -> dict:
         "headers": headers,
         "interesting_headers": interesting_headers,
         "notes": notes,
-        "fallback_reason": fallback_reason,
+        "fallback_reason": redact_text(fallback_reason) if fallback_reason else None,
     }
     response.close()
     return result
